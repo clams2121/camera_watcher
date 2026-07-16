@@ -21,19 +21,24 @@ import logging
 import queue
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 
+from .accumulator import MotionAccumulator
 from .capture import RtspCapture
 from .config import Config
 from .frame_buffer import FrameBuffer
 from .mask import MaskStore
 from .motion import MotionDetector
-from .recorder import TEMP_SUFFIX, RecorderConfig, SegmentRecorder
+from .recorder import TEMP_SUFFIX, BoundingBox, RecorderConfig, SegmentRecorder
 from .retention import RetentionConfig, enforce_retention
 
 logger = logging.getLogger(__name__)
+
+# BGR -- OpenCV's channel order -- for a high-contrast, easy-to-spot box.
+_BOX_COLOR = (0, 255, 0)  # bright green
 
 
 class CameraPipeline:
@@ -58,6 +63,10 @@ class CameraPipeline:
             history=motion_cfg["history"],
         )
         self._motion_enabled = motion_cfg["enabled"]
+        self._draw_bounding_box = motion_cfg["draw_bounding_box"]
+        self._box_padding_px = motion_cfg["box_padding_px"]
+        self._heatmap_path = Path(motion_cfg["heatmap_path"])
+        self.accumulator: Optional[MotionAccumulator] = None
 
         self.recorder = SegmentRecorder(self.frame_buffer, self._recorder_config(settings))
 
@@ -82,6 +91,7 @@ class CameraPipeline:
 
     def _recorder_config(self, settings: dict) -> RecorderConfig:
         rec = settings["recording"]
+        event_log_path = rec.get("event_log_path") or None
         return RecorderConfig(
             output_dir=Path(rec["output_dir"]),
             pre_buffer_seconds=rec["pre_buffer_seconds"],
@@ -91,6 +101,7 @@ class CameraPipeline:
             fourcc=rec["fourcc"],
             max_width=rec["max_width"],
             camera_name=settings["camera"]["name"],
+            event_log_path=Path(event_log_path) if event_log_path else None,
         )
 
     def _on_frame(self, timestamp: float, frame: np.ndarray) -> None:
@@ -129,16 +140,64 @@ class CameraPipeline:
                 continue
 
             motion_detected = False
+            boxes: List[BoundingBox] = []
             if self._motion_enabled:
                 try:
-                    motion_detected = self.motion_detector.process(frame).motion_detected
+                    result = self.motion_detector.process(frame)
+                    motion_detected = result.motion_detected
+                    if result.raw_foreground is not None:
+                        self._accumulate_heatmap(result.raw_foreground, result.analysis_size)
+                    if result.boxes:
+                        boxes = self._scale_boxes(result.boxes, result.analysis_size, frame.shape)
                 except Exception:
                     logger.exception("Motion detection failed on a frame")
 
+            frame_to_record = frame
+            if motion_detected and boxes and self._draw_bounding_box:
+                frame_to_record = self._draw_boxes(frame, boxes)
+
             try:
-                self.recorder.handle_frame(timestamp, frame, motion_detected)
+                self.recorder.handle_frame(timestamp, frame_to_record, motion_detected, boxes)
             except Exception:
                 logger.exception("Recording failed on a frame")
+
+    def _accumulate_heatmap(self, raw_foreground: np.ndarray, analysis_size: Tuple[int, int]) -> None:
+        width, height = analysis_size
+        if width <= 0 or height <= 0:
+            return
+        if self.accumulator is None:
+            self.accumulator = MotionAccumulator(self._heatmap_path, width, height)
+        try:
+            self.accumulator.add(raw_foreground)
+        except Exception:
+            logger.exception("Failed to update the motion heatmap accumulator")
+
+    def _scale_boxes(
+        self, boxes: List[BoundingBox], analysis_size: Tuple[int, int], frame_shape: tuple
+    ) -> List[BoundingBox]:
+        analysis_w, analysis_h = analysis_size
+        if analysis_w <= 0 or analysis_h <= 0:
+            return []
+        frame_h, frame_w = frame_shape[:2]
+        scale_x, scale_y = frame_w / analysis_w, frame_h / analysis_h
+        pad = self._box_padding_px
+        scaled = []
+        for x, y, w, h in boxes:
+            x1 = max(0, int(x * scale_x) - pad)
+            y1 = max(0, int(y * scale_y) - pad)
+            x2 = min(frame_w, int((x + w) * scale_x) + pad)
+            y2 = min(frame_h, int((y + h) * scale_y) + pad)
+            scaled.append((x1, y1, x2 - x1, y2 - y1))
+        return scaled
+
+    def _draw_boxes(self, frame: np.ndarray, boxes: List[BoundingBox]) -> np.ndarray:
+        # Draw on a copy: `frame` is the same array sitting in the shared
+        # pre-roll buffer, and mutating it in place would bake this box into
+        # whatever future clip prepends it as pre-roll.
+        annotated = frame.copy()
+        for x, y, w, h in boxes:
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), _BOX_COLOR, 2)
+        return annotated
 
     def _cleanup_orphaned_temp_files(self) -> None:
         output_dir = Path(self.config.settings["recording"]["output_dir"])
@@ -172,17 +231,30 @@ class CameraPipeline:
         if self._process_thread:
             self._process_thread.join(timeout=5)
         self.recorder.flush_on_shutdown()
+        if self.accumulator is not None:
+            self.accumulator.save()
 
     def apply_settings(self, settings: dict) -> None:
         """Re-apply settings changed via the web UI, without restarting the process."""
         motion_cfg = settings["motion"]
         self._motion_enabled = motion_cfg["enabled"]
+        self._draw_bounding_box = motion_cfg["draw_bounding_box"]
+        self._box_padding_px = motion_cfg["box_padding_px"]
         self.motion_detector.configure(
             analysis_width=motion_cfg["analysis_width"],
             min_area=motion_cfg["min_area"],
             var_threshold=motion_cfg["var_threshold"],
             history=motion_cfg["history"],
         )
+
+        new_heatmap_path = Path(motion_cfg["heatmap_path"])
+        if new_heatmap_path != self._heatmap_path:
+            self._heatmap_path = new_heatmap_path
+            self.accumulator = None  # recreated lazily on the next frame, at the (possibly new) path
+        if self.accumulator is not None:
+            self.accumulator.save()
+            self.accumulator = None  # analysis resolution may have changed too; recreate lazily
+
         self.recorder.config = self._recorder_config(settings)
         rec = settings["recording"]
         self.frame_buffer.set_max_seconds(max(rec["pre_buffer_seconds"], rec["overlap_seconds"]) + 2)
@@ -191,6 +263,16 @@ class CameraPipeline:
 
     def reload_mask(self) -> None:
         self.mask_store.reload()
+
+    def heatmap_png(self) -> Optional[bytes]:
+        """PNG bytes for the current motion heatmap overlay, or None before any frame's been analyzed."""
+        if self.accumulator is None:
+            return None
+        return self.accumulator.heatmap_png()
+
+    def reset_heatmap(self) -> None:
+        if self.accumulator is not None:
+            self.accumulator.reset()
 
     def _start_retention_thread(self) -> None:
         def _run():
@@ -208,6 +290,14 @@ class CameraPipeline:
                         )
                     except Exception:
                         logger.exception("Retention sweep failed")
+                # Piggyback the heatmap accumulator's periodic persistence on
+                # this same timer rather than running a whole extra thread
+                # for it -- it's also saved on clean shutdown and on reset.
+                if self.accumulator is not None:
+                    try:
+                        self.accumulator.save()
+                    except Exception:
+                        logger.exception("Failed to persist the motion heatmap accumulator")
                 interval = max(retention_cfg.get("check_interval_seconds", 3600), 60)
                 if self._retention_stop.wait(interval):
                     break

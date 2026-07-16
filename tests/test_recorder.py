@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 
 from camera_watcher.frame_buffer import FrameBuffer
@@ -73,3 +75,53 @@ def test_forced_chunk_roll_creates_multiple_files(tmp_path):
     clips = [p for p in tmp_path.glob("*.mp4") if not p.name.endswith(TEMP_SUFFIX)]
     assert len(clips) >= 2
     assert not list(tmp_path.glob(f"*{TEMP_SUFFIX}"))  # nothing left mid-write
+
+
+def test_event_log_records_union_bbox_on_finalize(tmp_path):
+    buf = FrameBuffer(max_seconds=5)
+    log_path = tmp_path / "events.jsonl"
+    config = RecorderConfig(
+        output_dir=tmp_path,
+        pre_buffer_seconds=1,
+        post_buffer_seconds=1,
+        max_chunk_seconds=100,
+        overlap_seconds=0.5,
+        camera_name="cam",
+        event_log_path=log_path,
+    )
+    rec = SegmentRecorder(buf, config, fps_hint=10)
+
+    t0 = 5000.0
+    buf.append(make_frame(2), t0)
+    rec.handle_frame(t0, make_frame(2), True, boxes=[(10, 20, 30, 40)])  # -> (10,20)-(40,60)
+
+    t1 = t0 + 0.1
+    buf.append(make_frame(2), t1)
+    rec.handle_frame(t1, make_frame(2), True, boxes=[(5, 50, 10, 10)])  # -> (5,50)-(15,60); widens the union
+
+    final_ts = t1 + config.post_buffer_seconds + 0.5
+    buf.append(make_frame(1), final_ts)
+    rec.handle_frame(final_ts, make_frame(1), False)
+
+    assert log_path.exists()
+    lines = log_path.read_text().strip().splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["camera"] == "cam"
+    assert entry["clip"].startswith("cam_")
+    assert entry["bbox"] == [5, 20, 35, 40]  # union: x1=min(10,5)=5, y1=min(20,50)=20, x2=max(40,15)=40, y2=max(60,60)=60
+
+
+def test_event_log_disabled_by_default(tmp_path):
+    buf = FrameBuffer(max_seconds=5)
+    config = RecorderConfig(output_dir=tmp_path, pre_buffer_seconds=1, post_buffer_seconds=1, camera_name="cam")
+    rec = SegmentRecorder(buf, config, fps_hint=10)
+
+    t0 = 6000.0
+    buf.append(make_frame(2), t0)
+    rec.handle_frame(t0, make_frame(2), True, boxes=[(0, 0, 5, 5)])
+    final_ts = t0 + config.post_buffer_seconds + 0.5
+    buf.append(make_frame(1), final_ts)
+    rec.handle_frame(final_ts, make_frame(1), False)
+
+    assert list(tmp_path.glob("*.jsonl")) == []  # no log file created when event_log_path is unset

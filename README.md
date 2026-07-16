@@ -26,6 +26,9 @@ of the larger project.
   fully written.
 - A background sweep enforces the configured retention policy (max age
   and/or max total storage), only ever touching finalized clips.
+- A never-decaying motion heatmap and a per-clip event log (bounding boxes)
+  help spot spots that need a new or larger ignore zone -- see "Tuning
+  ignore zones" below.
 
 ## Threading model
 
@@ -117,6 +120,45 @@ in the browser with play/pause and ±10 second seek buttons (native scrubbing
 via the video's own controls too). The Ignore Mask tab lists drawn shapes
 alongside the canvas -- click one to highlight it, then "Delete selected
 shape" to remove just that one.
+
+## Tuning ignore zones: drawing past the edge, the heatmap, and event log
+
+Three features work together for diagnosing "this ignore zone isn't working"
+(e.g. something at the edge of frame -- a flag, a tree branch -- keeps
+triggering clips despite being outlined):
+
+- **Draw past the image edge.** The Ignore Mask canvas is shown larger than
+  the actual camera image, with a shaded margin around it (the dashed line
+  marks the real frame boundary). Points placed in that margin are still
+  saved and still apply -- useful for fully enclosing something that sways
+  at or past the edge of the visible frame, which a shape confined to the
+  visible image alone can't do.
+- **Motion heatmap.** Check "Show motion heatmap" on the Ignore Mask tab to
+  overlay where motion has fired, most-frequent spots most opaque. Unlike
+  ordinary detection, this reflects *all* raw motion, including inside
+  zones you've already marked ignored -- so it stays useful for confirming
+  an existing ignore zone actually covers a spot's full range of motion.
+  It **never decays or resets on its own** -- it's a running total from a
+  persisted file (`motion.heatmap_path`, default `data/motion_heatmap.npy`)
+  until you click "Reset heatmap."
+- **Per-clip motion log.** Every finalized clip appends one line to
+  `recording.event_log_path` (default `data/motion_events.jsonl`) with its
+  timestamp, filename, and the overall bounding box of what triggered it --
+  e.g. `{"timestamp": ..., "camera": "camera1", "clip": "camera1_....mp4",
+  "bbox": [x, y, w, h]}`. Set it to `""` to disable. Useful for scripting a
+  review of which regions keep triggering recordings over time.
+
+## Bounding boxes on recorded video
+
+`motion.draw_bounding_box` (off by default, toggleable from Settings) burns
+a bright green box around detected motion into recorded frames, padded
+`motion.box_padding_px` away from the contour so it doesn't obscure the
+moving object itself. It's meant as a tuning/testing aid -- turn it on while
+dialing in sensitivity and ignore zones, then back off so future recordings
+stay unannotated for any later analysis stage. It only affects frames
+recorded *after* motion starts within an event; prepended pre-roll frames
+(already captured before detection fired) are written as originally
+captured.
 
 ### Missing dependencies
 

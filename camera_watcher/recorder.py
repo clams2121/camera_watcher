@@ -19,11 +19,12 @@ per incoming frame from a single thread:
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -32,6 +33,8 @@ from .constants import TEMP_SUFFIX
 from .frame_buffer import FrameBuffer, TimedFrame
 
 logger = logging.getLogger(__name__)
+
+BoundingBox = Tuple[int, int, int, int]  # (x, y, w, h)
 
 
 @dataclass
@@ -44,6 +47,7 @@ class RecorderConfig:
     fourcc: str = "mp4v"
     max_width: int = 1920
     camera_name: str = "camera1"
+    event_log_path: Optional[Path] = None  # JSONL log of each clip's motion bounding box; None disables it
 
 
 def _timestamp_name(camera_name: str, ts: float, suffix: str) -> str:
@@ -74,6 +78,7 @@ class SegmentRecorder:
         self._chunk_start_ts: Optional[float] = None
         self._last_motion_ts: Optional[float] = None
         self._frame_size: Optional[tuple] = None
+        self._chunk_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2), full-frame coords
 
     @property
     def is_recording(self) -> bool:
@@ -87,7 +92,13 @@ class SegmentRecorder:
         if fps and fps > 0:
             self._fps_hint = fps
 
-    def handle_frame(self, timestamp: float, frame: np.ndarray, motion_detected: bool) -> None:
+    def handle_frame(
+        self,
+        timestamp: float,
+        frame: np.ndarray,
+        motion_detected: bool,
+        boxes: Sequence[BoundingBox] = (),
+    ) -> None:
         if motion_detected:
             self._last_motion_ts = timestamp
 
@@ -106,9 +117,20 @@ class SegmentRecorder:
                 return
 
         self._write_frame_raw(frame)
+        self._accumulate_bbox(boxes)
 
         if timestamp - self._chunk_start_ts >= self.config.max_chunk_seconds:
             self._roll_chunk(timestamp)
+
+    def _accumulate_bbox(self, boxes: Sequence[BoundingBox]) -> None:
+        for x, y, w, h in boxes:
+            box = (x, y, x + w, y + h)
+            if self._chunk_bbox is None:
+                self._chunk_bbox = box
+            else:
+                x1, y1, x2, y2 = self._chunk_bbox
+                bx1, by1, bx2, by2 = box
+                self._chunk_bbox = (min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2))
 
     def _open_chunk(self, boundary_ts: float, prepend_frames: Optional[list] = None) -> None:
         prepend_frames = prepend_frames or []
@@ -121,6 +143,7 @@ class SegmentRecorder:
         self._writer = None
         self._frame_size = None
         self._chunk_start_ts = boundary_ts
+        self._chunk_bbox = None
         self._recording = True
         logger.info("Starting recording chunk: %s (%d prepended frames)", name, len(prepend_frames))
 
@@ -157,8 +180,27 @@ class SegmentRecorder:
         if self._temp_path and self._temp_path.exists():
             self._temp_path.rename(self._final_path)
             logger.info("Finalized recording: %s", self._final_path.name)
+            self._log_event(self._final_path.name)
         self._temp_path = None
         self._final_path = None
+        self._chunk_bbox = None
+
+    def _log_event(self, clip_name: str) -> None:
+        if self.config.event_log_path is None or self._chunk_bbox is None:
+            return
+        x1, y1, x2, y2 = self._chunk_bbox
+        entry = {
+            "timestamp": time.time(),
+            "camera": self.config.camera_name,
+            "clip": clip_name,
+            "bbox": [x1, y1, x2 - x1, y2 - y1],
+        }
+        try:
+            self.config.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.config.event_log_path.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            logger.exception("Failed to append motion event log entry")
 
     def flush_on_shutdown(self) -> None:
         """Cleanly close any in-progress recording, e.g. during process shutdown."""

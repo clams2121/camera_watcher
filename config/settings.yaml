@@ -17,6 +17,9 @@ motion:
   min_area: 500 # minimum contour area (px, at analysis_width) to count as motion
   var_threshold: 25 # MOG2 sensitivity; lower = more sensitive
   history: 300 # number of frames of background history MOG2 considers
+  draw_bounding_box: false # burn a bright green box around detected motion into recorded frames -- testing/tuning aid, turn off once you're done so saved clips stay unmodified
+  box_padding_px: 12 # gap kept between the drawn box and the actual moving object, at full frame resolution
+  heatmap_path: data/motion_heatmap.npy # per-pixel motion counter that never decays; reset it from the Ignore Mask tab once you've reviewed it
 
 recording:
   output_dir: data/clips
@@ -26,6 +29,7 @@ recording:
   overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
   fourcc: mp4v # OpenCV VideoWriter fourcc
   max_width: 1920 # frames wider than this are downscaled before writing, to bound memory/CPU
+  event_log_path: data/motion_events.jsonl # one JSON line per finalized clip (timestamp, clip name, motion bounding box); set to "" to disable
 
 retention:
   enabled: true

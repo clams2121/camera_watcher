@@ -100,6 +100,16 @@ button[type="submit"], .mask-toolbar button {
   flex-wrap: wrap;
 }
 
+.inline-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.inline-checkbox input[type="checkbox"] { margin: 0; }
+
 .mask-layout {
   display: flex;
   gap: 1rem;

@@ -158,3 +158,17 @@ def get_recording(filename: str):
     # conditional=True (Flask's default) makes this honor Range requests,
     # which <video> needs to seek without downloading the whole file.
     return send_file(file_path, mimetype="video/mp4", conditional=True)
+
+
+@bp.get("/api/heatmap.png")
+def get_heatmap():
+    png = _pipeline().heatmap_png()
+    if png is None:
+        return jsonify({"error": "no motion analyzed yet"}), 503
+    return Response(png, mimetype="image/png")
+
+
+@bp.post("/api/heatmap/reset")
+def reset_heatmap():
+    _pipeline().reset_heatmap()
+    return jsonify({"ok": True})

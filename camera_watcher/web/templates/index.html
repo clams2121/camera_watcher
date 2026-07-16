@@ -44,6 +44,9 @@
           <label><input name="motion.enabled" type="checkbox"> Enabled</label>
           <label>Sensitivity (lower = more sensitive) <input name="motion.var_threshold" type="number" min="1" max="200"></label>
           <label>Minimum area (px) <input name="motion.min_area" type="number" min="1"></label>
+          <label><input name="motion.draw_bounding_box" type="checkbox"> Draw bounding box on recorded video</label>
+          <p class="hint">Burns a bright green box around detected motion into recorded frames -- useful while tuning, but turn this off once you're done so future recordings stay unmodified for later analysis.</p>
+          <label>Box padding (px) <input name="motion.box_padding_px" type="number" min="0" max="200"></label>
         </fieldset>
 
         <fieldset>
@@ -67,13 +70,18 @@
     </section>
 
     <section id="tab-mask" class="tab">
-      <p class="hint">Click to add points, click the first point again (or double-click) to close a shape. Shaded areas are ignored for motion detection.</p>
+      <p class="hint">Click to add points, click the first point again (or double-click) to close a shape. Shaded red areas are ignored for motion detection. The dashed border marks the edge of the camera image -- you can place points in the shaded margin outside it to fully enclose something that touches the edge.</p>
       <div class="mask-toolbar">
         <button id="refresh-snapshot">Refresh snapshot</button>
         <button id="undo-point">Undo last point</button>
         <button id="clear-shapes">Clear all shapes</button>
         <button id="save-mask">Save mask</button>
         <span id="mask-status"></span>
+      </div>
+      <div class="mask-toolbar">
+        <label class="inline-checkbox"><input id="toggle-heatmap" type="checkbox"> Show motion heatmap</label>
+        <button id="reset-heatmap">Reset heatmap</button>
+        <span id="heatmap-status" class="hint"></span>
       </div>
       <div class="mask-layout">
         <canvas id="mask-canvas"></canvas>

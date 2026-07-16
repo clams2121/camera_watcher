@@ -130,11 +130,25 @@
   const ctx = canvas.getContext("2d");
   const shapeListEl = document.getElementById("shape-list");
   const deleteShapeBtn = document.getElementById("delete-selected-shape");
+
+  // The canvas is drawn larger than the actual camera image by this fraction
+  // on every side, so a shape can fully enclose something touching the
+  // frame's edge. Points placed in that margin are stored as normalized
+  // coordinates outside [0, 1] -- valid in the mask format, and they clip
+  // naturally against the real frame when rasterized server-side.
+  const MARGIN_FRAC = 0.15;
+  let imgWidth = 0;
+  let imgHeight = 0;
+  let marginX = 0;
+  let marginY = 0;
+
   let snapshotImg = null;
   let shapes = [];
   let currentShape = [];
   let pendingPolygons = [];
   let selectedShapeIndex = null;
+  let showHeatmap = false;
+  let heatmapImg = null;
 
   function renderShapeList() {
     shapeListEl.innerHTML = "";
@@ -170,8 +184,8 @@
   }
 
   function applyPendingPolygons() {
-    if (!canvas.width || !canvas.height || pendingPolygons.length === 0) return;
-    shapes = pendingPolygons.map((poly) => poly.map(([nx, ny]) => [nx * canvas.width, ny * canvas.height]));
+    if (!imgWidth || !imgHeight || pendingPolygons.length === 0) return;
+    shapes = pendingPolygons.map((poly) => poly.map(([nx, ny]) => [nx * imgWidth + marginX, ny * imgHeight + marginY]));
     pendingPolygons = [];
     selectedShapeIndex = null;
     renderShapeList();
@@ -189,8 +203,12 @@
         const url = URL.createObjectURL(blob);
         const img = new Image();
         img.onload = () => {
-          canvas.width = img.naturalWidth;
-          canvas.height = img.naturalHeight;
+          imgWidth = img.naturalWidth;
+          imgHeight = img.naturalHeight;
+          marginX = imgWidth * MARGIN_FRAC;
+          marginY = imgHeight * MARGIN_FRAC;
+          canvas.width = imgWidth + marginX * 2;
+          canvas.height = imgHeight + marginY * 2;
           snapshotImg = img;
           applyPendingPolygons();
           redraw();
@@ -225,7 +243,21 @@
 
   function redraw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (snapshotImg) ctx.drawImage(snapshotImg, 0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = "#88888833";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (snapshotImg) ctx.drawImage(snapshotImg, marginX, marginY, imgWidth, imgHeight);
+    if (showHeatmap && heatmapImg) ctx.drawImage(heatmapImg, marginX, marginY, imgWidth, imgHeight);
+
+    // Dashed outline marking where the actual camera frame ends and the
+    // drawable margin begins.
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "#ffffffcc";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(marginX, marginY, imgWidth, imgHeight);
+    ctx.restore();
+
     ctx.lineWidth = 2;
     shapes.forEach((shape, idx) => {
       if (idx === selectedShapeIndex) {
@@ -296,7 +328,7 @@
   document.getElementById("refresh-snapshot").addEventListener("click", loadSnapshot);
 
   document.getElementById("save-mask").addEventListener("click", () => {
-    const polygons = shapes.map((shape) => shape.map(([x, y]) => [x / canvas.width, y / canvas.height]));
+    const polygons = shapes.map((shape) => shape.map(([x, y]) => [(x - marginX) / imgWidth, (y - marginY) / imgHeight]));
     fetch("/api/mask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -306,6 +338,45 @@
       .then((data) => {
         document.getElementById("mask-status").textContent = "Saved " + (data.polygons || []).length + " shape(s).";
       });
+  });
+
+  function loadHeatmap() {
+    const statusEl = document.getElementById("heatmap-status");
+    fetch("/api/heatmap.png?t=" + Date.now())
+      .then((r) => {
+        if (!r.ok) throw new Error("no heatmap yet");
+        return r.blob();
+      })
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          heatmapImg = img;
+          URL.revokeObjectURL(url);
+          statusEl.textContent = "";
+          redraw();
+        };
+        img.src = url;
+      })
+      .catch(() => {
+        heatmapImg = null;
+        statusEl.textContent = "No motion analyzed yet.";
+        redraw();
+      });
+  }
+
+  document.getElementById("toggle-heatmap").addEventListener("change", (evt) => {
+    showHeatmap = evt.target.checked;
+    if (showHeatmap) loadHeatmap();
+    else redraw();
+  });
+
+  document.getElementById("reset-heatmap").addEventListener("click", () => {
+    fetch("/api/heatmap/reset", { method: "POST" }).then(() => {
+      heatmapImg = null;
+      document.getElementById("heatmap-status").textContent = "Heatmap cleared.";
+      if (showHeatmap) redraw();
+    });
   });
 
   // ---------- Recordings ----------

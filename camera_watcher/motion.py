@@ -1,18 +1,24 @@
 """Motion detection: background subtraction on a downscaled frame, with an ignore mask."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
 import cv2
 import numpy as np
 
 from .mask import MaskStore
 
+BoundingBox = Tuple[int, int, int, int]  # (x, y, w, h), in analysis-resolution pixels
+
 
 @dataclass
 class MotionResult:
     motion_detected: bool
     score: int  # total foreground contour area (px^2, at analysis resolution) after masking
+    boxes: List[BoundingBox] = field(default_factory=list)  # per-contour boxes that passed min_area, post-mask
+    analysis_size: Tuple[int, int] = (0, 0)  # (width, height) that `boxes` and `raw_foreground` are relative to
+    raw_foreground: "np.ndarray | None" = None  # foreground mask *before* the ignore mask is applied
 
 
 class MotionDetector:
@@ -62,21 +68,35 @@ class MotionDetector:
     def process(self, frame: np.ndarray) -> MotionResult:
         h, w = frame.shape[:2]
         scale = self.analysis_width / w
-        small = cv2.resize(frame, (self.analysis_width, max(1, int(h * scale))))
+        analysis_h = max(1, int(h * scale))
+        small = cv2.resize(frame, (self.analysis_width, analysis_h))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        analysis_size = (self.analysis_width, analysis_h)
 
         fg = self._subtractor.apply(gray)
 
         if self._warmup_frames_remaining > 0:
             self._warmup_frames_remaining -= 1
-            return MotionResult(False, 0)
+            return MotionResult(False, 0, [], analysis_size, np.zeros_like(gray))
+
+        # Computed *before* the ignore mask, so callers (the motion
+        # accumulator/heatmap) can see everything that moved, including
+        # inside currently-ignored zones -- useful when deciding whether an
+        # ignore zone needs to be extended.
+        raw_fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)[1]
+        raw_fg = cv2.dilate(raw_fg, None, iterations=2)
 
         keep = self._mask_store.keep_mask(gray.shape[1], gray.shape[0])
-        fg = cv2.bitwise_and(fg, keep)
-        fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)[1]
-        fg = cv2.dilate(fg, None, iterations=2)
+        masked_fg = cv2.bitwise_and(raw_fg, keep)
 
-        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        score = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= self.min_area)
-        return MotionResult(score > 0, int(score))
+        contours, _ = cv2.findContours(masked_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        score = 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area >= self.min_area:
+                score += area
+                boxes.append(cv2.boundingRect(c))
+
+        return MotionResult(len(boxes) > 0, int(score), boxes, analysis_size, raw_fg)

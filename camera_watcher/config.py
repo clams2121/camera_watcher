@@ -35,6 +35,9 @@ DEFAULTS: dict[str, Any] = {
         "min_area": 500,
         "var_threshold": 25,
         "history": 300,
+        "draw_bounding_box": False,  # burn a box around detected motion into recorded frames -- testing aid, off by default
+        "box_padding_px": 12,  # gap kept between the box and the detected contour, at full frame resolution
+        "heatmap_path": "data/motion_heatmap.npy",  # never-decaying per-pixel motion accumulator, cleared via the UI
     },
     "recording": {
         "output_dir": "data/clips",
@@ -44,6 +47,7 @@ DEFAULTS: dict[str, Any] = {
         "overlap_seconds": 5,
         "fourcc": "mp4v",
         "max_width": 1920,
+        "event_log_path": "data/motion_events.jsonl",  # one JSON line per finalized clip with its motion bounding box; blank disables it
     },
     "retention": {
         "enabled": True,
