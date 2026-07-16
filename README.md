@@ -30,18 +30,33 @@ of the larger project.
 ## Install
 
 This repo is public, so it can be cloned anonymously over plain HTTPS -- no
-GitHub account, login, or token needed. Pick the directory you want it in
+GitHub account, login, or token needed. This work is currently on the
+`claude/rtsp-motion-detection-z3819y` branch (not yet merged to `main`), so
+check that branch out directly with `-b`. Pick the directory you want it in
 and clone straight into it:
 
 ```bash
-git clone https://github.com/clams2121/camera_watcher.git camera_watcher
+git clone -b claude/rtsp-motion-detection-z3819y https://github.com/clams2121/camera_watcher.git camera_watcher
 cd camera_watcher
 ```
 
-(`git clone <url> <directory>` names the destination directory explicitly;
-drop the second argument to use the repo name by default.) If your network
-requires an HTTPS proxy, set `HTTPS_PROXY`/`https_proxy` before cloning --
-no other configuration is needed for a plain, unauthenticated clone.
+(`git clone -b <branch> <url> <directory>` checks out that branch instead
+of the repo's default, and names the destination directory explicitly --
+drop the trailing directory argument to use the repo name by default.) If
+your network requires an HTTPS proxy, set `HTTPS_PROXY`/`https_proxy`
+before cloning -- no other configuration is needed for a plain,
+unauthenticated clone.
+
+If you already have a clone of `main` and just want to pull this branch
+into it instead of cloning fresh:
+
+```bash
+git fetch origin claude/rtsp-motion-detection-z3819y
+git checkout claude/rtsp-motion-detection-z3819y
+```
+
+Once this branch merges into `main`, drop the `-b`/fetch step above and
+just clone or pull `main` as usual.
 
 ## Setup
 
