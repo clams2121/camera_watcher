@@ -109,7 +109,8 @@ python -m camera_watcher.main
 ```
 
 Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
-Live Preview tabs).
+Live Preview tabs) -- from a browser **on that same machine**. To reach it
+from a different device, see Troubleshooting below.
 
 ### Missing dependencies
 
@@ -146,6 +147,40 @@ The sweep logic itself lives in `camera_watcher/retention.py` as a
 standalone function/CLI (`python -m camera_watcher.retention <clips_dir>
 --max-age-days 14`), so a separate process/module can also invoke it
 directly against the same clips directory later.
+
+## Troubleshooting: can't reach the web UI from another device
+
+`web.host` defaults to `0.0.0.0`, so the app already listens on every
+network interface on the machine it runs on -- it's not restricted to
+`localhost`. If `http://<host-machine-ip>:8080` doesn't load from a second
+device, work through these in order:
+
+1. **Confirm the app itself is healthy first, from the host machine:**
+   `curl http://localhost:8080/` there. If that fails, the problem is the
+   app/config, not networking -- check the terminal running
+   `camera_watcher.main` for errors. If it succeeds, the app is fine and the
+   rest of this list applies.
+2. **Use the host's actual LAN IP**, not `localhost`/`127.0.0.1` (that only
+   ever means "this machine" to whatever device you type it into). Find it
+   with `ip addr` / `hostname -I` (Linux), `ipconfig` (Windows), or `ifconfig`
+   (macOS) -- look for the address on your LAN/Wi-Fi adapter, not a VPN,
+   Docker, or loopback interface.
+3. **Check `config/settings.yaml`'s `web.host` hasn't been changed** to
+   `127.0.0.1` or `localhost` -- that would make it refuse connections from
+   anywhere but the host itself. It should be `0.0.0.0`.
+4. **Running inside Docker, WSL2, or a VM?** `0.0.0.0` inside the
+   container/VM is not automatically reachable from your LAN. Docker needs
+   an explicit published port (`docker run -p 8080:8080 ...`); WSL2 needs
+   either mirrored networking mode or its own port-forwarding setup.
+5. **Check the host machine's firewall** allows inbound connections on the
+   port (e.g. `sudo ufw allow 8080/tcp` on Ubuntu, or an inbound rule in
+   Windows Defender Firewall / macOS's firewall). This is the most common
+   blocker and won't show up in the app's own logs at all -- the connection
+   just times out.
+6. **Same network, but still nothing?** Some Wi-Fi networks (especially
+   guest networks) enable "client/AP isolation," which blocks device-to-device
+   traffic even on the same SSID/subnet. Try both devices on a wired
+   connection or a non-guest network to rule this out.
 
 ## Tests
 
