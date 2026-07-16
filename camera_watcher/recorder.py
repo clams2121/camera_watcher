@@ -28,11 +28,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from .constants import TEMP_SUFFIX
 from .frame_buffer import FrameBuffer, TimedFrame
 
 logger = logging.getLogger(__name__)
-
-TEMP_SUFFIX = ".rec.mp4"
 
 
 @dataclass

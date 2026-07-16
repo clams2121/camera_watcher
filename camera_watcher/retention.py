@@ -3,7 +3,10 @@
 Deliberately standalone (importable function + CLI) rather than baked only
 into the pipeline, so a future external process -- e.g. a cleanup service
 managing several camera_watcher instances -- can invoke the same policy
-directly against a clips directory.
+directly against a clips directory. This module intentionally has no
+third-party dependencies (unlike the rest of the project, it needs no
+OpenCV/Flask/PyYAML) so it can run standalone wherever Python 3 is
+available.
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .recorder import TEMP_SUFFIX
+from .constants import TEMP_SUFFIX
 
 logger = logging.getLogger(__name__)
 

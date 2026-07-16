@@ -1,6 +1,14 @@
 """Entrypoint: start the capture/motion/recording pipeline and the web UI together."""
 from __future__ import annotations
 
+# Checked before any of this project's own modules are imported, since those
+# transitively import the third-party packages being checked here -- this
+# way a missing dependency produces a clear message instead of a raw
+# ImportError traceback.
+from .dependency_check import check_dependencies
+
+check_dependencies()
+
 import argparse
 import logging
 import signal

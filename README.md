@@ -27,6 +27,22 @@ of the larger project.
 - A background sweep enforces the configured retention policy (max age
   and/or max total storage), only ever touching finalized clips.
 
+## Install
+
+This repo is public, so it can be cloned anonymously over plain HTTPS -- no
+GitHub account, login, or token needed. Pick the directory you want it in
+and clone straight into it:
+
+```bash
+git clone https://github.com/clams2121/camera_watcher.git camera_watcher
+cd camera_watcher
+```
+
+(`git clone <url> <directory>` names the destination directory explicitly;
+drop the second argument to use the repo name by default.) If your network
+requires an HTTPS proxy, set `HTTPS_PROXY`/`https_proxy` before cloning --
+no other configuration is needed for a plain, unauthenticated clone.
+
 ## Setup
 
 ```bash
@@ -49,6 +65,15 @@ python -m camera_watcher.main
 
 Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
 Live Preview tabs).
+
+### Missing dependencies
+
+Before doing anything else, `python -m camera_watcher.main` checks that
+OpenCV, NumPy, Flask, and PyYAML are all importable. If any are missing it
+prints exactly which packages are missing and how to install them (`pip
+install -r requirements.txt`), and exits, rather than failing with a raw
+traceback partway through startup. `camera_watcher/retention.py` has no
+third-party dependencies at all and can run standalone with just Python 3.
 
 ## Credentials -- please read
 
