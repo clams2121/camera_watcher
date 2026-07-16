@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>camera_watcher</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>camera_watcher</h1>
+    <nav>
+      <button class="tab-btn active" data-tab="settings">Settings</button>
+      <button class="tab-btn" data-tab="mask">Ignore Mask</button>
+      <button class="tab-btn" data-tab="preview">Live Preview</button>
+    </nav>
+    <span id="status-badge" class="status-badge">--</span>
+  </header>
+
+  <main>
+    <section id="tab-settings" class="tab active">
+      <form id="settings-form">
+        <fieldset>
+          <legend>Camera</legend>
+          <label>Name <input name="camera.name" type="text" required></label>
+          <label>Host / IP <input name="camera.host" type="text" required></label>
+          <label>Port <input name="camera.port" type="number" min="1" max="65535" required></label>
+          <label>Stream path <input name="camera.path" type="text" placeholder="/stream1"></label>
+          <label>Transport
+            <select name="camera.transport">
+              <option value="tcp">TCP (recommended)</option>
+              <option value="udp">UDP</option>
+            </select>
+          </label>
+          <label>Username <input name="credentials.username" type="text" autocomplete="off"></label>
+          <label>Password <input name="credentials.password" type="password" autocomplete="new-password" placeholder="(unchanged)"></label>
+          <p class="hint">Credentials are stored only in <code>config/secrets.yaml</code> on this server (gitignored) and never echoed back here.</p>
+          <p class="hint">Current URL: <code id="redacted-url"></code></p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Motion Detection</legend>
+          <label><input name="motion.enabled" type="checkbox"> Enabled</label>
+          <label>Sensitivity (lower = more sensitive) <input name="motion.var_threshold" type="number" min="1" max="200"></label>
+          <label>Minimum area (px) <input name="motion.min_area" type="number" min="1"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Recording</legend>
+          <label>Pre-motion buffer (seconds) <input name="recording.pre_buffer_seconds" type="number" min="0" max="120"></label>
+          <label>Post-motion buffer (seconds) <input name="recording.post_buffer_seconds" type="number" min="0" max="120"></label>
+          <label>Max chunk length (seconds, cap 180) <input name="recording.max_chunk_seconds" type="number" min="10" max="180"></label>
+          <label>Overlap between chunks (seconds) <input name="recording.overlap_seconds" type="number" min="0" max="60"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Retention</legend>
+          <label><input name="retention.enabled" type="checkbox"> Enabled</label>
+          <label>Max age (days) <input name="retention.max_age_days" type="number" min="0"></label>
+          <label>Max total storage (GB) <input name="retention.max_total_gb" type="number" min="0"></label>
+        </fieldset>
+
+        <button type="submit">Save settings</button>
+        <span id="settings-status"></span>
+      </form>
+    </section>
+
+    <section id="tab-mask" class="tab">
+      <p class="hint">Click to add points, click the first point again (or double-click) to close a shape. Shaded areas are ignored for motion detection.</p>
+      <div class="mask-toolbar">
+        <button id="refresh-snapshot">Refresh snapshot</button>
+        <button id="undo-point">Undo last point</button>
+        <button id="clear-shapes">Clear all shapes</button>
+        <button id="save-mask">Save mask</button>
+        <span id="mask-status"></span>
+      </div>
+      <canvas id="mask-canvas"></canvas>
+    </section>
+
+    <section id="tab-preview" class="tab">
+      <img id="preview-img" alt="live preview" src="">
+      <p class="hint">Updates at the configured preview frame rate. Start this tab to load the stream.</p>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

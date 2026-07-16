@@ -1,0 +1,42 @@
+# camera_watcher settings
+#
+# This file is safe to commit -- it contains no credentials.
+# Camera username/password live in config/secrets.yaml (gitignored).
+# Edit by hand, or via the web UI at /settings which rewrites this file.
+
+camera:
+  name: camera1
+  host: ""
+  port: 554
+  path: /
+  transport: tcp # tcp or udp
+
+motion:
+  enabled: true
+  analysis_width: 320 # frames are downscaled to this width before diffing, to save CPU
+  min_area: 500 # minimum contour area (px, at analysis_width) to count as motion
+  var_threshold: 25 # MOG2 sensitivity; lower = more sensitive
+  history: 300 # number of frames of background history MOG2 considers
+
+recording:
+  output_dir: data/clips
+  pre_buffer_seconds: 10 # seconds of video kept before motion is confirmed
+  post_buffer_seconds: 10 # seconds to keep recording after motion stops
+  max_chunk_seconds: 180 # hard cap per file (3 minutes)
+  overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
+  fourcc: mp4v # OpenCV VideoWriter fourcc
+  max_width: 1920 # frames wider than this are downscaled before writing, to bound memory/CPU
+
+retention:
+  enabled: true
+  max_age_days: 14
+  max_total_gb: 50
+  check_interval_seconds: 3600
+
+web:
+  host: 0.0.0.0
+  port: 8080
+  preview_fps: 5
+
+mask:
+  path: config/mask.json
