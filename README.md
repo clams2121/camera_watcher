@@ -109,8 +109,14 @@ python -m camera_watcher.main
 ```
 
 Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
-Live Preview tabs) -- from a browser **on that same machine**. To reach it
-from a different device, see Troubleshooting below.
+Live Preview / Recordings tabs) -- from a browser **on that same machine**.
+To reach it from a different device, see Troubleshooting below.
+
+The Recordings tab lists saved clips (newest first); clicking one streams it
+in the browser with play/pause and ±10 second seek buttons (native scrubbing
+via the video's own controls too). The Ignore Mask tab lists drawn shapes
+alongside the canvas -- click one to highlight it, then "Delete selected
+shape" to remove just that one.
 
 ### Missing dependencies
 

@@ -13,6 +13,7 @@
       <button class="tab-btn active" data-tab="settings">Settings</button>
       <button class="tab-btn" data-tab="mask">Ignore Mask</button>
       <button class="tab-btn" data-tab="preview">Live Preview</button>
+      <button class="tab-btn" data-tab="recordings">Recordings</button>
     </nav>
     <span id="status-badge" class="status-badge">--</span>
   </header>
@@ -74,12 +75,39 @@
         <button id="save-mask">Save mask</button>
         <span id="mask-status"></span>
       </div>
-      <canvas id="mask-canvas"></canvas>
+      <div class="mask-layout">
+        <canvas id="mask-canvas"></canvas>
+        <div class="shape-panel">
+          <p class="hint">Select a shape to highlight it, then delete it.</p>
+          <ul id="shape-list"></ul>
+          <button id="delete-selected-shape" disabled>Delete selected shape</button>
+        </div>
+      </div>
     </section>
 
     <section id="tab-preview" class="tab">
       <img id="preview-img" alt="live preview" src="">
       <p class="hint">Updates at the configured preview frame rate. Start this tab to load the stream.</p>
+    </section>
+
+    <section id="tab-recordings" class="tab">
+      <div class="recordings-layout">
+        <div class="recordings-list">
+          <div class="mask-toolbar">
+            <button id="refresh-recordings">Refresh</button>
+          </div>
+          <ul id="recordings-ul"><li class="hint">Loading...</li></ul>
+        </div>
+        <div class="recordings-player" id="recordings-player" hidden>
+          <h3 id="playing-name"></h3>
+          <video id="recording-video" controls preload="metadata"></video>
+          <div class="video-controls">
+            <button id="seek-back">&laquo; 10s</button>
+            <button id="play-pause">Play</button>
+            <button id="seek-fwd">10s &raquo;</button>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 

@@ -62,3 +62,38 @@ def test_status_endpoint(tmp_path):
     assert resp.status_code == 200
     body = resp.get_json()
     assert "connected" in body and "recording" in body
+
+
+def test_recordings_list_excludes_temp_files_and_streams_with_range_support(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "cam_20260101_000000.mp4").write_bytes(b"0123456789" * 10)
+    (clips_dir / "cam_20260101_000100.mp4.rec.mp4").write_bytes(b"still recording")
+
+    resp = client.get("/api/recordings")
+    assert resp.status_code == 200
+    recordings = resp.get_json()["recordings"]
+    assert len(recordings) == 1
+    assert recordings[0]["name"] == "cam_20260101_000000.mp4"
+    assert recordings[0]["size_bytes"] == 100
+
+    resp = client.get("/api/recordings/cam_20260101_000000.mp4")
+    assert resp.status_code == 200
+    assert resp.data == b"0123456789" * 10
+
+    # <video> relies on Range requests to seek -- must come back as 206 Partial Content.
+    resp = client.get("/api/recordings/cam_20260101_000000.mp4", headers={"Range": "bytes=0-9"})
+    assert resp.status_code == 206
+    assert resp.data == b"0123456789"
+
+
+def test_recording_rejects_temp_missing_and_non_mp4_names(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "cam_x.mp4.rec.mp4").write_bytes(b"still recording")
+
+    assert client.get("/api/recordings/cam_x.mp4.rec.mp4").status_code == 404
+    assert client.get("/api/recordings/does-not-exist.mp4").status_code == 404
+    assert client.get("/api/recordings/not-an-mp4.txt").status_code == 404

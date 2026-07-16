@@ -23,6 +23,12 @@
         loadMask();
         loadSnapshot();
       }
+
+      if (btn.dataset.tab === "recordings") {
+        loadRecordings();
+      } else {
+        recordingVideo.pause();
+      }
     });
   });
 
@@ -122,10 +128,37 @@
   // ---------- Mask editor ----------
   const canvas = document.getElementById("mask-canvas");
   const ctx = canvas.getContext("2d");
+  const shapeListEl = document.getElementById("shape-list");
+  const deleteShapeBtn = document.getElementById("delete-selected-shape");
   let snapshotImg = null;
   let shapes = [];
   let currentShape = [];
   let pendingPolygons = [];
+  let selectedShapeIndex = null;
+
+  function renderShapeList() {
+    shapeListEl.innerHTML = "";
+    shapes.forEach((shape, idx) => {
+      const li = document.createElement("li");
+      li.textContent = `Shape ${idx + 1} (${shape.length} points)`;
+      li.className = idx === selectedShapeIndex ? "selected" : "";
+      li.addEventListener("click", () => {
+        selectedShapeIndex = selectedShapeIndex === idx ? null : idx;
+        renderShapeList();
+        redraw();
+      });
+      shapeListEl.appendChild(li);
+    });
+    deleteShapeBtn.disabled = selectedShapeIndex === null;
+  }
+
+  deleteShapeBtn.addEventListener("click", () => {
+    if (selectedShapeIndex === null) return;
+    shapes.splice(selectedShapeIndex, 1);
+    selectedShapeIndex = null;
+    renderShapeList();
+    redraw();
+  });
 
   function loadMask() {
     fetch("/api/mask")
@@ -140,6 +173,8 @@
     if (!canvas.width || !canvas.height || pendingPolygons.length === 0) return;
     shapes = pendingPolygons.map((poly) => poly.map(([nx, ny]) => [nx * canvas.width, ny * canvas.height]));
     pendingPolygons = [];
+    selectedShapeIndex = null;
+    renderShapeList();
     redraw();
   }
 
@@ -191,10 +226,19 @@
   function redraw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (snapshotImg) ctx.drawImage(snapshotImg, 0, 0, canvas.width, canvas.height);
+    ctx.lineWidth = 2;
+    shapes.forEach((shape, idx) => {
+      if (idx === selectedShapeIndex) {
+        ctx.fillStyle = "rgba(59,110,165,0.45)";
+        ctx.strokeStyle = "#3b6ea5";
+      } else {
+        ctx.fillStyle = "rgba(255,0,0,0.35)";
+        ctx.strokeStyle = "red";
+      }
+      drawPolygon(shape, true);
+    });
     ctx.fillStyle = "rgba(255,0,0,0.35)";
     ctx.strokeStyle = "red";
-    ctx.lineWidth = 2;
-    shapes.forEach((shape) => drawPolygon(shape, true));
     if (currentShape.length) drawPolygon(currentShape, false);
   }
 
@@ -212,6 +256,7 @@
       if (Math.hypot(x - fx, y - fy) < 10) {
         shapes.push(currentShape);
         currentShape = [];
+        renderShapeList();
         redraw();
         return;
       }
@@ -225,19 +270,26 @@
     if (currentShape.length >= 3) {
       shapes.push(currentShape);
       currentShape = [];
+      renderShapeList();
       redraw();
     }
   });
 
   document.getElementById("undo-point").addEventListener("click", () => {
     if (currentShape.length) currentShape.pop();
-    else shapes.pop();
+    else {
+      shapes.pop();
+      selectedShapeIndex = null;
+      renderShapeList();
+    }
     redraw();
   });
 
   document.getElementById("clear-shapes").addEventListener("click", () => {
     shapes = [];
     currentShape = [];
+    selectedShapeIndex = null;
+    renderShapeList();
     redraw();
   });
 
@@ -255,4 +307,66 @@
         document.getElementById("mask-status").textContent = "Saved " + (data.polygons || []).length + " shape(s).";
       });
   });
+
+  // ---------- Recordings ----------
+  const recordingsUl = document.getElementById("recordings-ul");
+  const recordingsPlayer = document.getElementById("recordings-player");
+  const recordingVideo = document.getElementById("recording-video");
+  const playingNameEl = document.getElementById("playing-name");
+  const playPauseBtn = document.getElementById("play-pause");
+
+  function formatSize(bytes) {
+    if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(2) + " GB";
+    if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(1) + " MB";
+    return Math.round(bytes / 1024) + " KB";
+  }
+
+  function playRecording(name) {
+    playingNameEl.textContent = name;
+    recordingVideo.src = "/api/recordings/" + encodeURIComponent(name);
+    recordingsPlayer.hidden = false;
+    recordingVideo.load();
+    recordingVideo.play().catch(() => {}); // autoplay can be blocked by the browser; ignore
+  }
+
+  function loadRecordings() {
+    recordingsUl.innerHTML = '<li class="hint">Loading...</li>';
+    fetch("/api/recordings")
+      .then((r) => r.json())
+      .then((data) => {
+        const recordings = data.recordings || [];
+        recordingsUl.innerHTML = "";
+        if (recordings.length === 0) {
+          recordingsUl.innerHTML = '<li class="hint">No recordings yet.</li>';
+          return;
+        }
+        recordings.forEach((rec) => {
+          const li = document.createElement("li");
+          const when = new Date(rec.modified * 1000).toLocaleString();
+          li.textContent = `${rec.name} — ${when} (${formatSize(rec.size_bytes)})`;
+          li.addEventListener("click", () => playRecording(rec.name));
+          recordingsUl.appendChild(li);
+        });
+      })
+      .catch(() => {
+        recordingsUl.innerHTML = '<li class="hint">Failed to load recordings.</li>';
+      });
+  }
+
+  playPauseBtn.addEventListener("click", () => {
+    if (recordingVideo.paused) recordingVideo.play();
+    else recordingVideo.pause();
+  });
+  recordingVideo.addEventListener("play", () => (playPauseBtn.textContent = "Pause"));
+  recordingVideo.addEventListener("pause", () => (playPauseBtn.textContent = "Play"));
+
+  document.getElementById("seek-back").addEventListener("click", () => {
+    recordingVideo.currentTime = Math.max(0, recordingVideo.currentTime - 10);
+  });
+  document.getElementById("seek-fwd").addEventListener("click", () => {
+    const duration = isFinite(recordingVideo.duration) ? recordingVideo.duration : Infinity;
+    recordingVideo.currentTime = Math.min(duration, recordingVideo.currentTime + 10);
+  });
+
+  document.getElementById("refresh-recordings").addEventListener("click", loadRecordings);
 })();

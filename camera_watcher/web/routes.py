@@ -1,20 +1,29 @@
 """HTTP routes for the camera_watcher web UI.
 
-Deliberately small: a settings form, a mask editor, and a live preview --
-nothing else. All state changes are written straight through to disk via
-:class:`~camera_watcher.config.Config` and applied to the running pipeline
-immediately, with no separate "apply" step.
+Deliberately small: a settings form, a mask editor, a live preview, and a
+recordings browser -- nothing else. All state changes are written straight
+through to disk via :class:`~camera_watcher.config.Config` and applied to
+the running pipeline immediately, with no separate "apply" step.
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
+from pathlib import Path
 
 import cv2
-from flask import Blueprint, Response, current_app, jsonify, render_template, request
+from flask import Blueprint, Response, abort, current_app, jsonify, render_template, request, send_file
+
+from ..constants import TEMP_SUFFIX
 
 bp = Blueprint("camera_watcher", __name__)
 logger = logging.getLogger(__name__)
+
+# Recording filenames are always "<camera_name>_<YYYYMMDD>_<HHMMSS>.mp4"
+# (see recorder.py) -- reject anything else outright before it ever touches
+# the filesystem, so a crafted filename can't be used to escape output_dir.
+_CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.mp4$")
 
 
 def _config():
@@ -118,3 +127,34 @@ def get_stream():
             time.sleep(interval)
 
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@bp.get("/api/recordings")
+def list_recordings():
+    output_dir = Path(_config().settings["recording"]["output_dir"])
+    recordings = []
+    if output_dir.exists():
+        for p in output_dir.iterdir():
+            if p.is_file() and p.suffix == ".mp4" and not p.name.endswith(TEMP_SUFFIX):
+                try:
+                    stat = p.stat()
+                except OSError:
+                    continue
+                recordings.append({"name": p.name, "size_bytes": stat.st_size, "modified": stat.st_mtime})
+    recordings.sort(key=lambda r: r["modified"], reverse=True)
+    return jsonify({"recordings": recordings})
+
+
+@bp.get("/api/recordings/<filename>")
+def get_recording(filename: str):
+    if not _CLIP_NAME_RE.match(filename) or filename.endswith(TEMP_SUFFIX):
+        abort(404)
+
+    output_dir = Path(_config().settings["recording"]["output_dir"]).resolve()
+    file_path = (output_dir / filename).resolve()
+    if output_dir not in file_path.parents or not file_path.is_file():
+        abort(404)
+
+    # conditional=True (Flask's default) makes this honor Range requests,
+    # which <video> needs to seek without downloading the whole file.
+    return send_file(file_path, mimetype="video/mp4", conditional=True)
