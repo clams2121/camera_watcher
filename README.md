@@ -27,6 +27,25 @@ of the larger project.
 - A background sweep enforces the configured retention policy (max age
   and/or max total storage), only ever touching finalized clips.
 
+## Threading model
+
+Every stage runs on its own thread so a slow one can never stall another,
+and the web UI stays responsive no matter what the camera is doing:
+
+- **Capture thread** only reads frames off the RTSP socket and appends them
+  to the shared pre-roll buffer -- it never touches disk.
+- **Processing thread** pulls frames off a bounded queue and does the
+  actually-slow work: motion detection and writing video to disk. It's
+  decoupled from capture specifically so a slow disk write can never back up
+  RTSP reads. If processing falls behind, the queue sheds (drops) the
+  oldest-pending frames rather than growing without bound or blocking
+  capture; `/api/status` reports `dropped_frames` if this happens.
+- **Retention sweep** runs on its own timer thread.
+- **Web UI** (Flask) runs on the main thread with a threaded WSGI server, and
+  only ever touches the shared, thread-safe frame buffer and config -- never
+  the camera connection directly -- so `GET /` and the API always respond
+  immediately even while disconnected, reconnecting, or mid-recording.
+
 ## Install
 
 This repo is public, so it can be cloned anonymously over plain HTTPS -- no
@@ -60,6 +79,17 @@ just clone or pull `main` as usual.
 
 ## Setup
 
+On Debian/Ubuntu, the `venv` module is packaged separately from Python and
+`python3 -m venv` fails with a "No module named venv" / "ensurepip is not
+available" error until it's installed (substitute your actual `python3`
+version if it isn't 3.12):
+
+```bash
+sudo apt install python3.12-venv
+```
+
+Then create the virtual environment as usual:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -79,7 +109,8 @@ python -m camera_watcher.main
 ```
 
 Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
-Live Preview tabs).
+Live Preview tabs) -- from a browser **on that same machine**. To reach it
+from a different device, see Troubleshooting below.
 
 ### Missing dependencies
 
@@ -116,6 +147,40 @@ The sweep logic itself lives in `camera_watcher/retention.py` as a
 standalone function/CLI (`python -m camera_watcher.retention <clips_dir>
 --max-age-days 14`), so a separate process/module can also invoke it
 directly against the same clips directory later.
+
+## Troubleshooting: can't reach the web UI from another device
+
+`web.host` defaults to `0.0.0.0`, so the app already listens on every
+network interface on the machine it runs on -- it's not restricted to
+`localhost`. If `http://<host-machine-ip>:8080` doesn't load from a second
+device, work through these in order:
+
+1. **Confirm the app itself is healthy first, from the host machine:**
+   `curl http://localhost:8080/` there. If that fails, the problem is the
+   app/config, not networking -- check the terminal running
+   `camera_watcher.main` for errors. If it succeeds, the app is fine and the
+   rest of this list applies.
+2. **Use the host's actual LAN IP**, not `localhost`/`127.0.0.1` (that only
+   ever means "this machine" to whatever device you type it into). Find it
+   with `ip addr` / `hostname -I` (Linux), `ipconfig` (Windows), or `ifconfig`
+   (macOS) -- look for the address on your LAN/Wi-Fi adapter, not a VPN,
+   Docker, or loopback interface.
+3. **Check `config/settings.yaml`'s `web.host` hasn't been changed** to
+   `127.0.0.1` or `localhost` -- that would make it refuse connections from
+   anywhere but the host itself. It should be `0.0.0.0`.
+4. **Running inside Docker, WSL2, or a VM?** `0.0.0.0` inside the
+   container/VM is not automatically reachable from your LAN. Docker needs
+   an explicit published port (`docker run -p 8080:8080 ...`); WSL2 needs
+   either mirrored networking mode or its own port-forwarding setup.
+5. **Check the host machine's firewall** allows inbound connections on the
+   port (e.g. `sudo ufw allow 8080/tcp` on Ubuntu, or an inbound rule in
+   Windows Defender Firewall / macOS's firewall). This is the most common
+   blocker and won't show up in the app's own logs at all -- the connection
+   just times out.
+6. **Same network, but still nothing?** Some Wi-Fi networks (especially
+   guest networks) enable "client/AP isolation," which blocks device-to-device
+   traffic even on the same SSID/subnet. Try both devices on a wired
+   connection or a non-guest network to rule this out.
 
 ## Tests
 
