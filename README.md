@@ -27,6 +27,25 @@ of the larger project.
 - A background sweep enforces the configured retention policy (max age
   and/or max total storage), only ever touching finalized clips.
 
+## Threading model
+
+Every stage runs on its own thread so a slow one can never stall another,
+and the web UI stays responsive no matter what the camera is doing:
+
+- **Capture thread** only reads frames off the RTSP socket and appends them
+  to the shared pre-roll buffer -- it never touches disk.
+- **Processing thread** pulls frames off a bounded queue and does the
+  actually-slow work: motion detection and writing video to disk. It's
+  decoupled from capture specifically so a slow disk write can never back up
+  RTSP reads. If processing falls behind, the queue sheds (drops) the
+  oldest-pending frames rather than growing without bound or blocking
+  capture; `/api/status` reports `dropped_frames` if this happens.
+- **Retention sweep** runs on its own timer thread.
+- **Web UI** (Flask) runs on the main thread with a threaded WSGI server, and
+  only ever touches the shared, thread-safe frame buffer and config -- never
+  the camera connection directly -- so `GET /` and the API always respond
+  immediately even while disconnected, reconnecting, or mid-recording.
+
 ## Install
 
 This repo is public, so it can be cloned anonymously over plain HTTPS -- no

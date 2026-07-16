@@ -32,8 +32,9 @@
       .then((r) => r.json())
       .then((data) => {
         const badge = document.getElementById("status-badge");
+        const dropped = data.dropped_frames > 0 ? " • dropped " + data.dropped_frames : "";
         badge.textContent =
-          (data.connected ? "connected" : "disconnected") + (data.recording ? " • recording" : "");
+          (data.connected ? "connected" : "disconnected") + (data.recording ? " • recording" : "") + dropped;
         badge.className = "status-badge " + (data.connected ? "ok" : "bad") + (data.recording ? " rec" : "");
       })
       .catch(() => {});
