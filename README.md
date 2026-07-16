@@ -60,6 +60,17 @@ just clone or pull `main` as usual.
 
 ## Setup
 
+On Debian/Ubuntu, the `venv` module is packaged separately from Python and
+`python3 -m venv` fails with a "No module named venv" / "ensurepip is not
+available" error until it's installed (substitute your actual `python3`
+version if it isn't 3.12):
+
+```bash
+sudo apt install python3.12-venv
+```
+
+Then create the virtual environment as usual:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
