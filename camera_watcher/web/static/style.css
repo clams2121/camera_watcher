@@ -71,6 +71,27 @@ nav { display: flex; gap: 0.5rem; flex: 1; }
   font-weight: 600;
 }
 
+.update-btn {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.update-btn:hover { background: var(--accent); color: white; }
+.update-btn:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; color: var(--accent); }
+
+.update-banner {
+  background: var(--accent);
+  color: white;
+  text-align: center;
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+}
+
 main { padding: 1rem; }
 
 .tab { display: none; }
@@ -223,6 +244,36 @@ button[type="submit"], .mask-toolbar button {
 .recordings-list li:hover { background: #8882; }
 .recordings-list li.hint { cursor: default; }
 .recordings-list li.hint:hover { background: none; }
+
+.recordings-list li.recording-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  cursor: default;
+}
+
+.recording-info {
+  cursor: pointer;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-delete {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid #b3261e;
+  border-radius: 4px;
+  background: transparent;
+  color: #b3261e;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.recording-delete:hover { background: #b3261e; color: white; }
 
 .recordings-player { flex: 2 1 20rem; min-width: 16rem; }
 

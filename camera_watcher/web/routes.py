@@ -14,16 +14,19 @@ import signal
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import cv2
 from flask import Blueprint, Response, abort, current_app, jsonify, render_template, request, send_file
 
 from ..constants import TEMP_SUFFIX
+from ..update import install_dependencies, pull_latest, repo_root
 
 bp = Blueprint("camera_watcher", __name__)
 logger = logging.getLogger(__name__)
 
 _SHUTDOWN_CONFIRM_TEXT = "quit"
+_UPDATE_CONFIRM_TEXT = "update"
 
 # Recording filenames are always "<camera_name>_<YYYYMMDD>_<HHMMSS>.mp4"
 # (see recorder.py) -- reject anything else outright before it ever touches
@@ -150,19 +153,41 @@ def list_recordings():
     return jsonify({"recordings": recordings})
 
 
-@bp.get("/api/recordings/<filename>")
-def get_recording(filename: str):
+def _resolve_clip_path(filename: str) -> Optional[Path]:
+    """Validates `filename` against the recorder's naming pattern and resolves
+    it against the clips directory, refusing anything that would escape it.
+    Returns None if the name is invalid or doesn't point at a real, finalized clip."""
     if not _CLIP_NAME_RE.match(filename) or filename.endswith(TEMP_SUFFIX):
-        abort(404)
-
+        return None
     output_dir = Path(_config().settings["recording"]["output_dir"]).resolve()
     file_path = (output_dir / filename).resolve()
     if output_dir not in file_path.parents or not file_path.is_file():
+        return None
+    return file_path
+
+
+@bp.get("/api/recordings/<filename>")
+def get_recording(filename: str):
+    file_path = _resolve_clip_path(filename)
+    if file_path is None:
         abort(404)
 
     # conditional=True (Flask's default) makes this honor Range requests,
     # which <video> needs to seek without downloading the whole file.
     return send_file(file_path, mimetype="video/mp4", conditional=True)
+
+
+@bp.delete("/api/recordings/<filename>")
+def delete_recording(filename: str):
+    file_path = _resolve_clip_path(filename)
+    if file_path is None:
+        abort(404)
+    try:
+        file_path.unlink()
+    except OSError:
+        logger.exception("Failed to delete recording %s", filename)
+        return jsonify({"ok": False, "error": "failed to delete the file"}), 500
+    return jsonify({"ok": True})
 
 
 @bp.get("/api/heatmap.png")
@@ -197,3 +222,47 @@ def shutdown():
     logger.warning("Shutdown requested via the web UI -- stopping the server.")
     _schedule_shutdown()
     return jsonify({"ok": True, "message": "Server is stopping."})
+
+
+def _schedule_restart(delay: float = 0.5) -> None:
+    """Send this process SIGUSR1 shortly after returning, for the same
+    flush-the-response-first reason as _schedule_shutdown. main.py handles
+    SIGUSR1 by cleanly stopping the pipeline and then re-exec'ing itself,
+    picking up whatever code is now on disk."""
+    threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGUSR1)).start()
+
+
+@bp.post("/api/update")
+def update():
+    body = request.get_json(force=True, silent=True) or {}
+    confirm = str(body.get("confirm", "")).strip().lower()
+    if confirm != _UPDATE_CONFIRM_TEXT:
+        return jsonify({"ok": False, "error": f'confirmation text must be "{_UPDATE_CONFIRM_TEXT}"'}), 400
+
+    root = repo_root()
+    pull_result, updated = pull_latest(root)
+    if not pull_result.ok:
+        logger.warning("Update: git pull failed: %s", pull_result.message)
+        return jsonify({"ok": False, "updated": False, "error": pull_result.message}), 500
+
+    if not updated:
+        return jsonify({"ok": True, "updated": False, "message": pull_result.message})
+
+    deps_result = install_dependencies(root)
+    if not deps_result.ok:
+        logger.warning("Update: dependency install failed: %s", deps_result.message)
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "updated": True,
+                    "error": "Pulled new code, but installing dependencies failed -- not restarting: "
+                    + deps_result.message,
+                }
+            ),
+            500,
+        )
+
+    logger.warning("Update requested via the web UI -- pulled latest code, restarting.")
+    _schedule_restart()
+    return jsonify({"ok": True, "updated": True, "message": "Updated. Restarting..."})

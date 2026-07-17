@@ -11,7 +11,9 @@ check_dependencies()
 
 import argparse
 import logging
+import os
 import signal
+import sys
 
 from .config import DEFAULT_SECRETS_PATH, DEFAULT_SETTINGS_PATH, Config
 from .pipeline import CameraPipeline
@@ -38,8 +40,24 @@ def main() -> None:
         pipeline.stop()
         raise SystemExit(0)
 
+    def _restart(signum, frame):
+        # Re-exec explicitly via `-m camera_watcher.main` (rather than
+        # forwarding sys.argv as-is) so relative imports still work
+        # afterwards regardless of how this process was originally launched.
+        logging.getLogger(__name__).info("Restarting to pick up updated code...")
+        pipeline.stop()
+        python = sys.executable
+        module_args = ["-m", "camera_watcher.main", "--settings", args.settings, "--secrets", args.secrets]
+        try:
+            os.execv(python, [python] + module_args)
+        except OSError:
+            logging.getLogger(__name__).exception("Restart failed; exiting instead")
+            raise SystemExit(1)
+
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
+    if hasattr(signal, "SIGUSR1"):  # not available on Windows
+        signal.signal(signal.SIGUSR1, _restart)
 
     app = create_app(config, pipeline)
     web_cfg = config.settings["web"]

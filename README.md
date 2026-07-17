@@ -122,9 +122,11 @@ To reach it from a different device, see Troubleshooting below.
 
 The Recordings tab lists saved clips (newest first); clicking one streams it
 in the browser with play/pause and ±10 second seek buttons (native scrubbing
-via the video's own controls too). The Ignore Mask tab lists drawn shapes
-alongside the canvas -- click one to highlight it, then "Delete selected
-shape" to remove just that one.
+via the video's own controls too). Each clip also has its own "Delete"
+button (asks for confirmation) for removing individual recordings without
+waiting on retention. The Ignore Mask tab lists drawn shapes alongside the
+canvas -- click one to highlight it, then "Delete selected shape" to remove
+just that one.
 
 The header's "Stop Server" button asks you to type `quit` to confirm, then
 cleanly shuts the whole process down (capture, recording, retention, the
@@ -133,6 +135,37 @@ terminal). If you're running this under something that auto-restarts
 crashed/exited processes (a systemd unit with `Restart=always`, `docker run
 --restart unless-stopped`, etc.), it'll just come back up -- stop it at that
 supervisor level too if you actually want it to stay down.
+
+## Updating from the web UI
+
+The header's "Update & Restart" button asks you to type `update` to confirm,
+then:
+
+1. Runs `git pull --ff-only` in the checkout this process is running from.
+   Fast-forward only -- it refuses (and reports an error, without touching
+   anything else) rather than creating a merge commit or discarding local
+   history if the branch has diverged.
+2. If nothing changed, it stops there and tells you you're already current
+   -- no restart.
+3. If it pulled something, it reinstalls `requirements.txt` with the same
+   Python environment the server is already running under. If that fails,
+   it stops there too and reports the error, deliberately **not**
+   restarting into a checkout whose dependencies didn't install cleanly.
+4. Only once both steps succeed does it restart: it cleanly stops the
+   pipeline (same as the Stop Server button) and then re-execs itself in
+   place (`os.execv`, same process ID, no supervisor required), which picks
+   up the newly pulled code on the way back up. The page polls until the
+   server responds again and reloads itself automatically.
+
+Since `config/settings.yaml`/`secrets.yaml`/`mask.json` are all gitignored
+(see below), a `git pull` here can't collide with anything you've configured
+through the UI -- only tracked source files are affected.
+
+**Worth knowing**: like every other button in this UI, `/api/update` has no
+authentication -- anyone who can reach the web UI can trigger it, and it
+runs whatever code is at the tip of your branch upstream. That's consistent
+with the rest of this tool (no login anywhere), but is worth keeping in mind
+if this is reachable beyond a trusted LAN.
 
 ## Tuning ignore zones: drawing past the edge, the heatmap, and event log
 

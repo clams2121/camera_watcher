@@ -175,3 +175,115 @@ def test_shutdown_accepts_case_insensitive_confirmation(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert resp.get_json()["ok"] is True
     assert calls == [True]
+
+
+def test_delete_recording_removes_the_file(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clip = clips_dir / "cam_20260101_000000.mp4"
+    clip.write_bytes(b"data")
+
+    resp = client.delete("/api/recordings/cam_20260101_000000.mp4")
+    assert resp.status_code == 200
+    assert resp.get_json()["ok"] is True
+    assert not clip.exists()
+
+
+def test_delete_recording_rejects_temp_missing_and_non_mp4_names(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    temp_clip = clips_dir / "cam_x.mp4.rec.mp4"
+    temp_clip.write_bytes(b"still recording")
+
+    assert client.delete("/api/recordings/cam_x.mp4.rec.mp4").status_code == 404
+    assert temp_clip.exists()  # never touched
+    assert client.delete("/api/recordings/does-not-exist.mp4").status_code == 404
+    assert client.delete("/api/recordings/not-an-mp4.txt").status_code == 404
+
+
+def test_update_rejects_wrong_confirmation_without_touching_git(tmp_path, monkeypatch):
+    from camera_watcher.web import routes
+
+    calls = []
+    monkeypatch.setattr(routes, "pull_latest", lambda *a, **k: calls.append("pull"))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/update", json={"confirm": "nope"})
+    assert resp.status_code == 400
+    assert resp.get_json()["ok"] is False
+    assert calls == []
+
+
+def test_update_reports_up_to_date_without_restarting(tmp_path, monkeypatch):
+    from camera_watcher.update import CommandResult
+    from camera_watcher.web import routes
+
+    monkeypatch.setattr(routes, "pull_latest", lambda root: (CommandResult(True, "Already up to date."), False))
+    restart_calls = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/update", json={"confirm": "update"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["updated"] is False
+    assert restart_calls == []
+
+
+def test_update_reports_pull_failure_without_restarting(tmp_path, monkeypatch):
+    from camera_watcher.update import CommandResult
+    from camera_watcher.web import routes
+
+    monkeypatch.setattr(
+        routes, "pull_latest", lambda root: (CommandResult(False, "fatal: not a fast-forward"), False)
+    )
+    restart_calls = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/update", json={"confirm": "update"})
+    assert resp.status_code == 500
+    body = resp.get_json()
+    assert body["ok"] is False
+    assert "fast-forward" in body["error"]
+    assert restart_calls == []
+
+
+def test_update_reports_dependency_install_failure_without_restarting(tmp_path, monkeypatch):
+    from camera_watcher.update import CommandResult
+    from camera_watcher.web import routes
+
+    monkeypatch.setattr(routes, "pull_latest", lambda root: (CommandResult(True, "Fast-forwarded."), True))
+    monkeypatch.setattr(routes, "install_dependencies", lambda root: CommandResult(False, "pip explosion"))
+    restart_calls = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/update", json={"confirm": "UPDATE"})  # case-insensitive
+    assert resp.status_code == 500
+    body = resp.get_json()
+    assert body["ok"] is False
+    assert body["updated"] is True
+    assert "pip explosion" in body["error"]
+    assert restart_calls == []
+
+
+def test_update_succeeds_and_schedules_restart(tmp_path, monkeypatch):
+    from camera_watcher.update import CommandResult
+    from camera_watcher.web import routes
+
+    monkeypatch.setattr(routes, "pull_latest", lambda root: (CommandResult(True, "Fast-forwarded."), True))
+    monkeypatch.setattr(routes, "install_dependencies", lambda root: CommandResult(True, "Dependencies installed."))
+    restart_calls = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/update", json={"confirm": "update"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["updated"] is True
+    assert restart_calls == [True]

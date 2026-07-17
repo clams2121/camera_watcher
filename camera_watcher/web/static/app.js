@@ -32,6 +32,67 @@
       });
   });
 
+  // ---------- Update & restart ----------
+  function waitForServerAndReload(banner) {
+    const poll = () => {
+      fetch("/api/status", { cache: "no-store" })
+        .then((r) => {
+          if (r.ok) location.reload();
+          else setTimeout(poll, 2000);
+        })
+        .catch(() => setTimeout(poll, 2000));
+    };
+    // Give the old process a moment to actually exit before the first poll,
+    // so we don't just immediately hit the still-running old version.
+    setTimeout(poll, 3000);
+  }
+
+  document.getElementById("update-server").addEventListener("click", () => {
+    const typed = window.prompt(
+      "This pulls the latest code from GitHub, reinstalls dependencies if needed, and restarts the server.\n" +
+        'Type "update" to confirm:'
+    );
+    if (typed === null) return; // cancelled
+    if (typed.trim().toLowerCase() !== "update") {
+      window.alert('Not confirmed -- you must type exactly "update". Nothing was changed.');
+      return;
+    }
+
+    const banner = document.getElementById("update-banner");
+    const btn = document.getElementById("update-server");
+    btn.disabled = true;
+    banner.textContent = "Checking for updates...";
+    banner.hidden = false;
+
+    fetch("/api/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: "update" }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok || !data.ok) {
+          banner.hidden = true;
+          btn.disabled = false;
+          window.alert((data && data.error) || "Update failed.");
+          return;
+        }
+        if (!data.updated) {
+          banner.hidden = true;
+          btn.disabled = false;
+          window.alert(data.message || "Already up to date.");
+          return;
+        }
+        banner.textContent = "Updated -- restarting with the latest code. This page will reload automatically.";
+        waitForServerAndReload(banner);
+      })
+      .catch(() => {
+        window.alert("Failed to reach the server to request an update.");
+        banner.hidden = true;
+        btn.disabled = false;
+      });
+  });
+
   // ---------- Tabs ----------
   const previewImg = document.getElementById("preview-img");
   let maskLoaded = false;
@@ -431,6 +492,30 @@
     recordingVideo.play().catch(() => {}); // autoplay can be blocked by the browser; ignore
   }
 
+  function stopPlaybackIfShowing(name) {
+    if (playingNameEl.textContent !== name) return;
+    recordingVideo.pause();
+    recordingVideo.removeAttribute("src");
+    recordingVideo.load();
+    recordingsPlayer.hidden = true;
+    playingNameEl.textContent = "";
+  }
+
+  function deleteRecording(name) {
+    if (!window.confirm(`Delete "${name}"? This can't be undone.`)) return;
+    fetch("/api/recordings/" + encodeURIComponent(name), { method: "DELETE" })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok || !data.ok) {
+          window.alert((data && data.error) || "Failed to delete the recording.");
+          return;
+        }
+        stopPlaybackIfShowing(name);
+        loadRecordings();
+      })
+      .catch(() => window.alert("Failed to delete the recording."));
+  }
+
   function loadRecordings() {
     recordingsUl.innerHTML = '<li class="hint">Loading...</li>';
     fetch("/api/recordings")
@@ -444,9 +529,26 @@
         }
         recordings.forEach((rec) => {
           const li = document.createElement("li");
+          li.className = "recording-item";
+
+          const info = document.createElement("span");
+          info.className = "recording-info";
           const when = new Date(rec.modified * 1000).toLocaleString();
-          li.textContent = `${rec.name} — ${when} (${formatSize(rec.size_bytes)})`;
-          li.addEventListener("click", () => playRecording(rec.name));
+          info.textContent = `${rec.name} — ${when} (${formatSize(rec.size_bytes)})`;
+          info.title = rec.name;
+          info.addEventListener("click", () => playRecording(rec.name));
+
+          const deleteBtn = document.createElement("button");
+          deleteBtn.className = "recording-delete";
+          deleteBtn.textContent = "Delete";
+          deleteBtn.title = `Delete ${rec.name}`;
+          deleteBtn.addEventListener("click", (evt) => {
+            evt.stopPropagation();
+            deleteRecording(rec.name);
+          });
+
+          li.appendChild(info);
+          li.appendChild(deleteBtn);
           recordingsUl.appendChild(li);
         });
       })
