@@ -2,6 +2,7 @@
 accumulator) pipeline wiring -- run frames through the real motion detector
 via the pipeline's processing thread, no real camera needed.
 """
+import json
 import threading
 import time
 
@@ -68,9 +69,9 @@ def test_bounding_box_drawn_on_a_copy_not_the_shared_buffer_frame(tmp_path):
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=()):
+    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
         received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes)
+        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -95,9 +96,9 @@ def test_bounding_box_not_drawn_when_disabled(tmp_path):
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=()):
+    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
         received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes)
+        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -117,9 +118,9 @@ def test_heatmap_accumulates_and_reset_clears_it(tmp_path):
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=()):
+    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
         received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes)
+        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -133,6 +134,48 @@ def test_heatmap_accumulates_and_reset_clears_it(tmp_path):
 
         pipeline.reset_heatmap()
         assert int(pipeline.accumulator.counts.max()) == 0
+    finally:
+        pipeline._process_stop.set()
+        pipeline._process_thread.join(timeout=2)
+
+
+def test_companion_metadata_written_with_real_score_and_detection_size(tmp_path):
+    """End-to-end: score/detection_fraction computed by the pipeline from the
+    real motion detector's output must reach the recorder and show up,
+    non-trivially, in the companion metadata JSON."""
+    pipeline = _make_pipeline(tmp_path, draw_bounding_box=False)
+    received = []
+    original_handle_frame = pipeline.recorder.handle_frame
+
+    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
+        received.append((frame, motion_detected, boxes))
+        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+
+    pipeline.recorder.handle_frame = spy
+
+    try:
+        base_ts = 9900.0
+        _warm_up_and_trigger_motion(pipeline, received, base_ts)
+
+        # Let the post-buffer lapse so the clip actually finalizes.
+        final_ts = base_ts + 15 * 0.1 + pipeline.recorder.config.post_buffer_seconds + 0.5
+        final_frame = make_frame(0)
+        pipeline.frame_buffer.append(final_frame, final_ts)
+        pipeline._on_frame(final_ts, final_frame)
+        assert _wait_until(lambda: len(received) == 17)
+        assert _wait_until(lambda: not pipeline.recorder.is_recording)
+
+        clips = list((tmp_path / "clips").glob("*.mp4"))
+        assert len(clips) == 1
+        metadata_path = clips[0].with_suffix(".json")
+        assert metadata_path.exists()
+
+        metadata = json.loads(metadata_path.read_text())
+        assert metadata["camera_id"] == "camera1"
+        assert metadata["video_path"] == str(clips[0].resolve())
+        assert metadata["detection_size"] > 0
+        assert metadata["motion_confidence"]["max_score"] > 0
+        assert metadata["motion_confidence"]["motion_frame_ratio"] > 0
     finally:
         pipeline._process_stop.set()
         pipeline._process_thread.join(timeout=2)

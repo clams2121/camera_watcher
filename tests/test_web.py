@@ -89,7 +89,9 @@ def test_recordings_list_excludes_temp_files_and_streams_with_range_support(tmp_
 
     resp = client.get("/api/recordings")
     assert resp.status_code == 200
-    recordings = resp.get_json()["recordings"]
+    groups = resp.get_json()["groups"]
+    assert len(groups) == 1
+    recordings = groups[0]["recordings"]
     assert len(recordings) == 1
     assert recordings[0]["name"] == "cam_20260101_000000.mp4"
     assert recordings[0]["size_bytes"] == 100
@@ -177,17 +179,20 @@ def test_shutdown_accepts_case_insensitive_confirmation(tmp_path, monkeypatch):
     assert calls == [True]
 
 
-def test_delete_recording_removes_the_file(tmp_path):
+def test_delete_recording_removes_the_file_and_its_metadata(tmp_path):
     client = make_client(tmp_path)
     clips_dir = tmp_path / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
     clip = clips_dir / "cam_20260101_000000.mp4"
     clip.write_bytes(b"data")
+    metadata = clips_dir / "cam_20260101_000000.json"
+    metadata.write_text("{}")
 
     resp = client.delete("/api/recordings/cam_20260101_000000.mp4")
     assert resp.status_code == 200
     assert resp.get_json()["ok"] is True
     assert not clip.exists()
+    assert not metadata.exists()
 
 
 def test_delete_recording_rejects_temp_missing_and_non_mp4_names(tmp_path):
@@ -201,6 +206,64 @@ def test_delete_recording_rejects_temp_missing_and_non_mp4_names(tmp_path):
     assert temp_clip.exists()  # never touched
     assert client.delete("/api/recordings/does-not-exist.mp4").status_code == 404
     assert client.delete("/api/recordings/not-an-mp4.txt").status_code == 404
+
+
+def test_recordings_are_grouped_into_half_hour_buckets_aligned_to_00_and_30(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "cam_20260117_135959.mp4",  # -> 13:30-14:00 bucket
+        "cam_20260117_140000.mp4",  # -> 14:00-14:30 bucket
+        "cam_20260117_142959.mp4",  # -> 14:00-14:30 bucket
+        "cam_20260117_143000.mp4",  # -> 14:30-15:00 bucket
+    ):
+        (clips_dir / name).write_bytes(b"x")
+
+    resp = client.get("/api/recordings")
+    assert resp.status_code == 200
+    groups = resp.get_json()["groups"]
+
+    assert [g["bucket"] for g in groups] == ["20260117_1430", "20260117_1400", "20260117_1330"]  # newest first
+
+    by_bucket = {g["bucket"]: g for g in groups}
+    assert sorted(r["name"] for r in by_bucket["20260117_1400"]["recordings"]) == [
+        "cam_20260117_140000.mp4",
+        "cam_20260117_142959.mp4",
+    ]
+    assert [r["name"] for r in by_bucket["20260117_1330"]["recordings"]] == ["cam_20260117_135959.mp4"]
+    assert [r["name"] for r in by_bucket["20260117_1430"]["recordings"]] == ["cam_20260117_143000.mp4"]
+
+
+def test_delete_recording_group_removes_only_that_buckets_clips(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    keep = clips_dir / "cam_20260117_143000.mp4"
+    keep.write_bytes(b"x")
+    gone1 = clips_dir / "cam_20260117_140000.mp4"
+    gone1.write_bytes(b"x")
+    gone1_meta = clips_dir / "cam_20260117_140000.json"
+    gone1_meta.write_text("{}")
+    gone2 = clips_dir / "cam_20260117_142000.mp4"
+    gone2.write_bytes(b"x")
+
+    resp = client.delete("/api/recordings/group/20260117_1400")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert sorted(body["deleted"]) == ["cam_20260117_140000.mp4", "cam_20260117_142000.mp4"]
+
+    assert not gone1.exists()
+    assert not gone1_meta.exists()  # companion metadata removed too
+    assert not gone2.exists()
+    assert keep.exists()  # different bucket, untouched
+
+
+def test_delete_recording_group_rejects_malformed_bucket(tmp_path):
+    client = make_client(tmp_path)
+    assert client.delete("/api/recordings/group/not-a-bucket").status_code == 404
+    assert client.delete("/api/recordings/group/2026011_1400").status_code == 404  # wrong digit count
 
 
 def test_update_rejects_wrong_confirmation_without_touching_git(tmp_path, monkeypatch):

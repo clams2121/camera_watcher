@@ -39,12 +39,25 @@ def _finalized_clips(output_dir: Path) -> list:
     ]
 
 
+def _unlink_clip_and_metadata(clip: Path) -> None:
+    """Removes a clip and its companion <clip stem>.json metadata file, if
+    any. The metadata file is best-effort -- its absence/removal failure
+    doesn't stop the clip itself from being removed."""
+    clip.unlink()
+    metadata_path = clip.with_suffix(".json")
+    try:
+        metadata_path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Failed to remove metadata file %s", metadata_path)
+
+
 def enforce_retention(config: RetentionConfig) -> list:
     """Delete oldest finalized clips exceeding age/size limits. Returns files removed.
 
     Never touches in-progress recordings -- their filenames carry a temp
     suffix and are excluded -- so this is safe to run concurrently with an
-    active recorder.
+    active recorder. Each clip's companion metadata JSON (if any) is removed
+    alongside it.
     """
     clips = _finalized_clips(config.output_dir)
     removed = []
@@ -54,7 +67,7 @@ def enforce_retention(config: RetentionConfig) -> list:
         for clip in clips:
             try:
                 if clip.stat().st_mtime < cutoff:
-                    clip.unlink()
+                    _unlink_clip_and_metadata(clip)
                     removed.append(clip)
             except OSError:
                 logger.exception("Failed to remove expired clip %s", clip)
@@ -74,7 +87,7 @@ def enforce_retention(config: RetentionConfig) -> list:
         while total > max_bytes and i < len(clips_with_stat):
             clip, st = clips_with_stat[i]
             try:
-                clip.unlink()
+                _unlink_clip_and_metadata(clip)
                 removed.append(clip)
                 total -= st.st_size
             except OSError:

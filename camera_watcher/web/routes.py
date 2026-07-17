@@ -13,6 +13,7 @@ import re
 import signal
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +33,44 @@ _UPDATE_CONFIRM_TEXT = "update"
 # (see recorder.py) -- reject anything else outright before it ever touches
 # the filesystem, so a crafted filename can't be used to escape output_dir.
 _CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.mp4$")
+_CLIP_TS_RE = re.compile(r"_(\d{8})_(\d{6})\.mp4$")
+_BUCKET_RE = re.compile(r"^\d{8}_\d{4}$")
+
+
+def _clip_start_datetime(path: Path, stat) -> datetime:
+    """Best-effort start time for grouping: parsed from the recorder's
+    embedded filename timestamp (second precision, already includes
+    pre-buffer compensation -- see recorder.py's _timestamp_name), falling
+    back to the file's mtime for anything that doesn't match."""
+    m = _CLIP_TS_RE.search(path.name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(stat.st_mtime)
+
+
+def _bucket_key(dt: datetime) -> str:
+    """30-minute bucket aligned to :00/:30, as "YYYYMMDD_HHMM"."""
+    bucket_minute = 0 if dt.minute < 30 else 30
+    return dt.replace(minute=bucket_minute, second=0, microsecond=0).strftime("%Y%m%d_%H%M")
+
+
+def _bucket_bounds(bucket: str):
+    start = datetime.strptime(bucket, "%Y%m%d_%H%M")
+    end = start + timedelta(minutes=30)
+    return start.isoformat(), end.isoformat()
+
+
+def _unlink_clip_and_metadata(file_path: Path) -> None:
+    """Removes a clip and its companion <clip stem>.json metadata file, if any."""
+    file_path.unlink()
+    metadata_path = file_path.with_suffix(".json")
+    try:
+        metadata_path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Failed to remove metadata file %s", metadata_path)
 
 
 def _config():
@@ -139,8 +178,11 @@ def get_stream():
 
 @bp.get("/api/recordings")
 def list_recordings():
+    """Recordings grouped into 30-minute buckets aligned to :00/:30, newest
+    group first, newest clip first within each group -- lets the UI offer a
+    "delete this whole half-hour" action alongside per-clip delete."""
     output_dir = Path(_config().settings["recording"]["output_dir"])
-    recordings = []
+    buckets: dict = {}
     if output_dir.exists():
         for p in output_dir.iterdir():
             if p.is_file() and p.suffix == ".mp4" and not p.name.endswith(TEMP_SUFFIX):
@@ -148,9 +190,17 @@ def list_recordings():
                     stat = p.stat()
                 except OSError:
                     continue
-                recordings.append({"name": p.name, "size_bytes": stat.st_size, "modified": stat.st_mtime})
-    recordings.sort(key=lambda r: r["modified"], reverse=True)
-    return jsonify({"recordings": recordings})
+                key = _bucket_key(_clip_start_datetime(p, stat))
+                buckets.setdefault(key, []).append(
+                    {"name": p.name, "size_bytes": stat.st_size, "modified": stat.st_mtime}
+                )
+
+    groups = []
+    for key in sorted(buckets.keys(), reverse=True):
+        recordings = sorted(buckets[key], key=lambda r: r["modified"], reverse=True)
+        start_iso, end_iso = _bucket_bounds(key)
+        groups.append({"bucket": key, "start": start_iso, "end": end_iso, "recordings": recordings})
+    return jsonify({"groups": groups})
 
 
 def _resolve_clip_path(filename: str) -> Optional[Path]:
@@ -183,11 +233,41 @@ def delete_recording(filename: str):
     if file_path is None:
         abort(404)
     try:
-        file_path.unlink()
+        _unlink_clip_and_metadata(file_path)
     except OSError:
         logger.exception("Failed to delete recording %s", filename)
         return jsonify({"ok": False, "error": "failed to delete the file"}), 500
     return jsonify({"ok": True})
+
+
+@bp.delete("/api/recordings/group/<bucket>")
+def delete_recording_group(bucket: str):
+    if not _BUCKET_RE.match(bucket):
+        abort(404)
+
+    output_dir = Path(_config().settings["recording"]["output_dir"])
+    deleted = []
+    errors = []
+    if output_dir.exists():
+        for p in output_dir.iterdir():
+            if not (p.is_file() and p.suffix == ".mp4" and not p.name.endswith(TEMP_SUFFIX)):
+                continue
+            try:
+                stat = p.stat()
+            except OSError:
+                continue
+            if _bucket_key(_clip_start_datetime(p, stat)) != bucket:
+                continue
+            try:
+                _unlink_clip_and_metadata(p)
+                deleted.append(p.name)
+            except OSError:
+                logger.exception("Failed to delete %s", p.name)
+                errors.append(p.name)
+
+    if errors and not deleted:
+        return jsonify({"ok": False, "error": f"Failed to delete {len(errors)} file(s)", "deleted": deleted}), 500
+    return jsonify({"ok": True, "deleted": deleted, "errors": errors})
 
 
 @bp.get("/api/heatmap.png")

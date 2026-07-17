@@ -141,14 +141,18 @@ class CameraPipeline:
 
             motion_detected = False
             boxes: List[BoundingBox] = []
+            score = 0
+            detection_fraction = 0.0
             if self._motion_enabled:
                 try:
                     result = self.motion_detector.process(frame)
                     motion_detected = result.motion_detected
+                    score = result.score
                     if result.raw_foreground is not None:
                         self._accumulate_heatmap(result.raw_foreground, result.analysis_size)
                     if result.boxes:
                         boxes = self._scale_boxes(result.boxes, result.analysis_size, frame.shape)
+                        detection_fraction = self._max_detection_fraction(result.boxes, result.analysis_size)
                 except Exception:
                     logger.exception("Motion detection failed on a frame")
 
@@ -157,9 +161,28 @@ class CameraPipeline:
                 frame_to_record = self._draw_boxes(frame, boxes)
 
             try:
-                self.recorder.handle_frame(timestamp, frame_to_record, motion_detected, boxes)
+                self.recorder.handle_frame(
+                    timestamp,
+                    frame_to_record,
+                    motion_detected,
+                    boxes,
+                    score=score,
+                    detection_fraction=detection_fraction,
+                )
             except Exception:
                 logger.exception("Recording failed on a frame")
+
+    def _max_detection_fraction(self, boxes: List[BoundingBox], analysis_size: Tuple[int, int]) -> float:
+        """Max fraction of the analyzed frame's area any single detected
+        contour covered -- computed from the raw (unpadded) boxes, at
+        analysis resolution. Area *ratio* is scale-invariant since motion.py
+        preserves aspect ratio when downscaling, so this equals the fraction
+        at full frame resolution too, without needing to convert."""
+        analysis_w, analysis_h = analysis_size
+        frame_area = analysis_w * analysis_h
+        if frame_area <= 0 or not boxes:
+            return 0.0
+        return max((w * h) / frame_area for _, _, w, h in boxes)
 
     def _accumulate_heatmap(self, raw_foreground: np.ndarray, analysis_size: Tuple[int, int]) -> None:
         width, height = analysis_size

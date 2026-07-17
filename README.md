@@ -120,13 +120,14 @@ Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
 Live Preview / Recordings tabs) -- from a browser **on that same machine**.
 To reach it from a different device, see Troubleshooting below.
 
-The Recordings tab lists saved clips (newest first); clicking one streams it
-in the browser with play/pause and ±10 second seek buttons (native scrubbing
-via the video's own controls too). Each clip also has its own "Delete"
-button (asks for confirmation) for removing individual recordings without
-waiting on retention. The Ignore Mask tab lists drawn shapes alongside the
-canvas -- click one to highlight it, then "Delete selected shape" to remove
-just that one.
+The Recordings tab groups clips into 30-minute buckets aligned to :00/:30
+(newest group first); clicking a clip streams it in the browser with
+play/pause and ±10 second seek buttons (native scrubbing via the video's own
+controls too). Each clip has its own "Delete" button, and each group header
+has a "Delete all" button for clearing a whole half-hour at once -- both ask
+for confirmation first. Neither waits on retention. The Ignore Mask tab
+lists drawn shapes alongside the canvas -- click one to highlight it, then
+"Delete selected shape" to remove just that one.
 
 The header's "Stop Server" button asks you to type `quit` to confirm, then
 cleanly shuts the whole process down (capture, recording, retention, the
@@ -205,6 +206,34 @@ stay unannotated for any later analysis stage. It only affects frames
 recorded *after* motion starts within an event; prepended pre-roll frames
 (already captured before detection fired) are written as originally
 captured.
+
+## Companion metadata for each clip
+
+Every finalized clip gets a same-named `.json` file alongside it (e.g.
+`camera1_20260117_140030.mp4` -> `camera1_20260117_140030.json`) -- written
+right after the video finishes, deleted along with it (retention, single
+delete, and group delete all remove both together):
+
+```json
+{
+  "event_id": "camera1_20260117_140030",
+  "camera_id": "camera1",
+  "start_time": "2026-01-17T14:00:28.512340-05:00",
+  "end_time": "2026-01-17T14:00:42.881230-05:00",
+  "video_path": "/abs/path/to/data/clips/camera1_20260117_140030.mp4",
+  "motion_confidence": {"mean_score": 812.4, "max_score": 2350.0, "motion_frame_ratio": 0.6667},
+  "motion_time": 8.0,
+  "detection_size": 0.1
+}
+```
+
+- **event_id**: the clip's filename stem (camera name + timestamp combined) -- a stable, unique key for this event.
+- **camera_id**: the configured camera name.
+- **start_time** / **end_time**: ISO 8601 with UTC offset, covering the *actual* written content -- including the pre-buffer prepended at the start and any post-buffer cooldown at the end, not just the moment motion was first confirmed.
+- **video_path**: absolute path to the clip.
+- **motion_confidence**: this detector uses background subtraction + contour area, not a neural net, so there's no built-in 0-1 probability -- instead: `mean_score`/`max_score` are the average/peak raw per-frame motion score (contour area) across frames where motion was actually detected, and `motion_frame_ratio` is the fraction of all frames in the clip that had motion detected at all, as a proxy for how consistent the detection was through the clip.
+- **motion_time**: total seconds (not a fraction) where motion was detected, summed across the live portion of the clip -- 4 decimal places.
+- **detection_size**: the largest single detected contour's bounding-box area as a fraction of the frame (e.g. `0.1` = the biggest detection covered 10% of the image at its peak) -- 4 decimal places.
 
 ### Missing dependencies
 

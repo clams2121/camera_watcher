@@ -275,6 +275,19 @@ button[type="submit"], .mask-toolbar button {
 
 .recording-delete:hover { background: #b3261e; color: white; }
 
+.recordings-list li.group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  background: #8882;
+  font-weight: 600;
+  font-size: 0.78rem;
+  cursor: default;
+}
+
+.recordings-list li.group-header:hover { background: #8882; }
+
 .recordings-player { flex: 2 1 20rem; min-width: 16rem; }
 
 #recording-video {

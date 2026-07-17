@@ -516,40 +516,86 @@
       .catch(() => window.alert("Failed to delete the recording."));
   }
 
+  function deleteRecordingGroup(group) {
+    const count = group.recordings.length;
+    if (!window.confirm(`Delete all ${count} recording(s) between ${formatGroupLabel(group)}? This can't be undone.`)) return;
+    fetch("/api/recordings/group/" + encodeURIComponent(group.bucket), { method: "DELETE" })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok || !data.ok) {
+          window.alert((data && data.error) || "Failed to delete the group.");
+          return;
+        }
+        (data.deleted || []).forEach(stopPlaybackIfShowing);
+        loadRecordings();
+      })
+      .catch(() => window.alert("Failed to delete the group."));
+  }
+
+  function formatGroupLabel(group) {
+    const start = new Date(group.start);
+    const end = new Date(group.end);
+    const timeOpts = { hour: "numeric", minute: "2-digit" };
+    return `${start.toLocaleDateString()} ${start.toLocaleTimeString([], timeOpts)}–${end.toLocaleTimeString([], timeOpts)}`;
+  }
+
+  function buildGroupHeader(group) {
+    const li = document.createElement("li");
+    li.className = "group-header";
+
+    const label = document.createElement("span");
+    label.textContent = `${formatGroupLabel(group)} (${group.recordings.length})`;
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "recording-delete";
+    deleteBtn.textContent = "Delete all";
+    deleteBtn.title = "Delete every recording in this half-hour";
+    deleteBtn.addEventListener("click", () => deleteRecordingGroup(group));
+
+    li.appendChild(label);
+    li.appendChild(deleteBtn);
+    return li;
+  }
+
+  function buildRecordingRow(rec) {
+    const li = document.createElement("li");
+    li.className = "recording-item";
+
+    const info = document.createElement("span");
+    info.className = "recording-info";
+    const when = new Date(rec.modified * 1000).toLocaleString();
+    info.textContent = `${rec.name} — ${when} (${formatSize(rec.size_bytes)})`;
+    info.title = rec.name;
+    info.addEventListener("click", () => playRecording(rec.name));
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "recording-delete";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.title = `Delete ${rec.name}`;
+    deleteBtn.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      deleteRecording(rec.name);
+    });
+
+    li.appendChild(info);
+    li.appendChild(deleteBtn);
+    return li;
+  }
+
   function loadRecordings() {
     recordingsUl.innerHTML = '<li class="hint">Loading...</li>';
     fetch("/api/recordings")
       .then((r) => r.json())
       .then((data) => {
-        const recordings = data.recordings || [];
+        const groups = data.groups || [];
         recordingsUl.innerHTML = "";
-        if (recordings.length === 0) {
+        if (groups.length === 0) {
           recordingsUl.innerHTML = '<li class="hint">No recordings yet.</li>';
           return;
         }
-        recordings.forEach((rec) => {
-          const li = document.createElement("li");
-          li.className = "recording-item";
-
-          const info = document.createElement("span");
-          info.className = "recording-info";
-          const when = new Date(rec.modified * 1000).toLocaleString();
-          info.textContent = `${rec.name} — ${when} (${formatSize(rec.size_bytes)})`;
-          info.title = rec.name;
-          info.addEventListener("click", () => playRecording(rec.name));
-
-          const deleteBtn = document.createElement("button");
-          deleteBtn.className = "recording-delete";
-          deleteBtn.textContent = "Delete";
-          deleteBtn.title = `Delete ${rec.name}`;
-          deleteBtn.addEventListener("click", (evt) => {
-            evt.stopPropagation();
-            deleteRecording(rec.name);
-          });
-
-          li.appendChild(info);
-          li.appendChild(deleteBtn);
-          recordingsUl.appendChild(li);
+        groups.forEach((group) => {
+          recordingsUl.appendChild(buildGroupHeader(group));
+          group.recordings.forEach((rec) => recordingsUl.appendChild(buildRecordingRow(rec)));
         });
       })
       .catch(() => {
