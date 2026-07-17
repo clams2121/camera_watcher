@@ -102,8 +102,13 @@ cp config/secrets.yaml.example config/secrets.yaml
 # edit config/secrets.yaml with your camera's username/password
 ```
 
-Edit `config/settings.yaml` (or use the web UI once running) for the
-camera's host/port/path and the motion/recording/retention parameters.
+`config/settings.yaml` doesn't need to be created by hand -- the first time
+the app runs, it's seeded automatically from the checked-in
+`config/settings.example.yaml`. From then on it's yours to edit directly (or
+through the web UI, which writes back to the same file); it's gitignored,
+so local changes never show up as something to commit. Only
+`settings.example.yaml` is tracked in git, documenting every option with its
+default value.
 
 Run it:
 
@@ -179,21 +184,38 @@ third-party dependencies at all and can run standalone with just Python 3.
 
 ## Credentials -- please read
 
-Camera credentials are **never** stored in `config/settings.yaml` (which is
-safe to commit) and always go in `config/secrets.yaml`, which is listed in
-`.gitignore` and must never be committed. Only `config/secrets.yaml.example`
-(with blank values) is tracked in git. The web UI's password field never
-echoes back the stored password -- it always displays blank, and leaving it
-blank on save keeps the existing value.
+Camera credentials are **never** stored in `config/settings.yaml` and always
+go in `config/secrets.yaml` instead, kept as a separate file so the two
+can't accidentally get mixed up. Both files are gitignored (see "Local
+config, not checked into git" below) -- neither is ever meant to be
+committed. Only `config/secrets.yaml.example` (with blank values) is tracked
+in git. The web UI's password field never echoes back the stored password --
+it always displays blank, and leaving it blank on save keeps the existing
+value.
 
 Before committing, double check `git status` doesn't show
-`config/secrets.yaml`, `config/mask.json`, or anything under `data/`.
+`config/settings.yaml`, `config/secrets.yaml`, `config/mask.json`, or
+anything under `data/`.
+
+## Local config, not checked into git
+
+Everything this app writes to disk on its own -- `config/settings.yaml`,
+`config/secrets.yaml`, `config/mask.json`, the motion heatmap, event log,
+and recorded clips under `data/` -- is gitignored. Only checked-in
+*templates* live in git:
+
+| Tracked template (safe to commit) | Local file it produces (gitignored) |
+| --- | --- |
+| `config/settings.example.yaml` | `config/settings.yaml` -- auto-copied the first time the app runs, so it starts with every documented default already in place |
+| `config/mask.example.json` | `config/mask.json` -- *not* auto-copied (its sample polygon is just a format example, not a sensible default for your camera); starts with no ignore zones and is created once you draw and save your first shape |
+| `config/secrets.yaml.example` | `config/secrets.yaml` -- copy it yourself and fill in real credentials (see Setup above); there's no safe default to seed it with |
 
 ## Configuration reference
 
-See `config/settings.yaml` for the full set of options with inline comments,
-covering camera connection, motion sensitivity, recording buffer/chunk/
-overlap timing, retention limits, and the web server.
+See `config/settings.example.yaml` for the full set of options with inline
+comments, covering camera connection, motion sensitivity, recording
+buffer/chunk/overlap timing, retention limits, and the web server -- your
+actual `config/settings.yaml` starts as a copy of it and has the same shape.
 
 ## Retention
 

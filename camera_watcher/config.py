@@ -1,9 +1,15 @@
 """Configuration loading and persistence.
 
-Settings are split across two files so credentials never end up in git:
+Only ``config/settings.example.yaml`` is checked into git -- it documents
+every setting with its default value and is never written to by this code.
+The two files actually read/written at runtime are both gitignored, so
+neither camera credentials nor a user's locally-tuned settings ever end up
+in version control:
 
-- ``settings.yaml`` -- everything non-secret, safe to commit.
-- ``secrets.yaml``  -- camera username/password only, gitignored.
+- ``settings.yaml`` -- non-secret settings; seeded from
+  ``settings.example.yaml`` the first time it's needed, then read/written by
+  the app (including every save from the web UI) from then on.
+- ``secrets.yaml``  -- camera username/password only.
 
 Both are merged over :data:`DEFAULTS` / :data:`SECRET_DEFAULTS` so a partial
 or missing file still yields a complete, usable configuration.
@@ -11,6 +17,7 @@ or missing file still yields a complete, usable configuration.
 from __future__ import annotations
 
 import copy
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -19,6 +26,7 @@ from urllib.parse import quote
 import yaml
 
 DEFAULT_SETTINGS_PATH = Path("config/settings.yaml")
+DEFAULT_SETTINGS_EXAMPLE_PATH = Path("config/settings.example.yaml")
 DEFAULT_SECRETS_PATH = Path("config/secrets.yaml")
 
 DEFAULTS: dict[str, Any] = {
@@ -79,6 +87,18 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _seed_settings_if_missing(settings_path: Path, example_path: Path) -> None:
+    """The first time ``settings_path`` doesn't exist yet, copy the checked-in
+    example file to it so there's a real, hand-editable file with every
+    option documented -- and never touches it again after that (existing
+    settings, including anything a user has already tuned, are never
+    overwritten)."""
+    if settings_path.exists() or not example_path.exists():
+        return
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(example_path, settings_path)
+
+
 def _load_yaml(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -106,12 +126,19 @@ class Config:
         self,
         settings_path: Path | str = DEFAULT_SETTINGS_PATH,
         secrets_path: Path | str = DEFAULT_SECRETS_PATH,
+        settings_example_path: Path | str | None = None,
     ):
         self.settings_path = Path(settings_path)
         self.secrets_path = Path(secrets_path)
+        example_path = (
+            Path(settings_example_path)
+            if settings_example_path is not None
+            else self.settings_path.with_name("settings.example.yaml")
+        )
         self._lock = threading.RLock()
         self._settings: dict = {}
         self._secrets: dict = {}
+        _seed_settings_if_missing(self.settings_path, example_path)
         self.reload()
 
     def reload(self) -> None:

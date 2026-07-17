@@ -47,3 +47,35 @@ def test_rtsp_url_building_and_redaction(tmp_path):
     redacted = config.redacted_rtsp_url()
     assert "user" not in redacted
     assert "192.168.1.10:554/stream1" in redacted
+
+
+def test_seeds_settings_from_example_on_first_run(tmp_path):
+    example_path = tmp_path / "settings.example.yaml"
+    example_path.write_text("camera:\n  host: 10.1.1.1\n  name: frontdoor\n")
+    settings_path = tmp_path / "settings.yaml"
+
+    config = Config(settings_path, tmp_path / "secrets.yaml")
+
+    assert settings_path.exists()
+    assert settings_path.read_text() == example_path.read_text()
+    assert config.settings["camera"]["host"] == "10.1.1.1"
+    assert config.settings["camera"]["name"] == "frontdoor"
+
+
+def test_does_not_overwrite_settings_that_already_exist(tmp_path):
+    example_path = tmp_path / "settings.example.yaml"
+    example_path.write_text("camera:\n  host: 10.1.1.1\n")
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text("camera:\n  host: 192.168.9.9\n")  # user already has real settings
+
+    config = Config(settings_path, tmp_path / "secrets.yaml")
+
+    assert config.settings["camera"]["host"] == "192.168.9.9"  # untouched, not clobbered by the example
+
+
+def test_missing_example_falls_back_to_builtin_defaults(tmp_path):
+    settings_path = tmp_path / "settings.yaml"  # no settings.example.yaml alongside it
+    config = Config(settings_path, tmp_path / "secrets.yaml")
+
+    assert not settings_path.exists()  # nothing to seed from, and nothing written until a save happens
+    assert config.settings["camera"]["port"] == 554  # built-in DEFAULTS still apply
