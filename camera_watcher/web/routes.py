@@ -8,7 +8,10 @@ the running pipeline immediately, with no separate "apply" step.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import signal
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +22,8 @@ from ..constants import TEMP_SUFFIX
 
 bp = Blueprint("camera_watcher", __name__)
 logger = logging.getLogger(__name__)
+
+_SHUTDOWN_CONFIRM_TEXT = "quit"
 
 # Recording filenames are always "<camera_name>_<YYYYMMDD>_<HHMMSS>.mp4"
 # (see recorder.py) -- reject anything else outright before it ever touches
@@ -172,3 +177,23 @@ def get_heatmap():
 def reset_heatmap():
     _pipeline().reset_heatmap()
     return jsonify({"ok": True})
+
+
+def _schedule_shutdown(delay: float = 0.5) -> None:
+    """Send this process SIGTERM shortly after returning, so the HTTP
+    response has time to flush to the client before shutdown begins. main.py
+    already handles SIGTERM by cleanly stopping the pipeline (capture,
+    recorder, retention, accumulator) before exiting -- reused as-is here."""
+    threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+
+@bp.post("/api/shutdown")
+def shutdown():
+    body = request.get_json(force=True, silent=True) or {}
+    confirm = str(body.get("confirm", "")).strip().lower()
+    if confirm != _SHUTDOWN_CONFIRM_TEXT:
+        return jsonify({"ok": False, "error": f'confirmation text must be "{_SHUTDOWN_CONFIRM_TEXT}"'}), 400
+
+    logger.warning("Shutdown requested via the web UI -- stopping the server.")
+    _schedule_shutdown()
+    return jsonify({"ok": True, "message": "Server is stopping."})

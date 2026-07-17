@@ -50,6 +50,27 @@ nav { display: flex; gap: 0.5rem; flex: 1; }
 .status-badge.bad { border-color: #b3261e; color: #b3261e; }
 .status-badge.rec { border-color: #b3261e; background: #b3261e22; }
 
+.danger-btn {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #b3261e;
+  border-radius: 6px;
+  background: transparent;
+  color: #b3261e;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.danger-btn:hover { background: #b3261e; color: white; }
+.danger-btn:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; color: #b3261e; }
+
+.shutdown-banner {
+  background: #b3261e;
+  color: white;
+  text-align: center;
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+}
+
 main { padding: 1rem; }
 
 .tab { display: none; }

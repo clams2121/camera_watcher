@@ -121,6 +121,14 @@ via the video's own controls too). The Ignore Mask tab lists drawn shapes
 alongside the canvas -- click one to highlight it, then "Delete selected
 shape" to remove just that one.
 
+The header's "Stop Server" button asks you to type `quit` to confirm, then
+cleanly shuts the whole process down (capture, recording, retention, the
+heatmap accumulator all stop/flush the same way as Ctrl+C does in the
+terminal). If you're running this under something that auto-restarts
+crashed/exited processes (a systemd unit with `Restart=always`, `docker run
+--restart unless-stopped`, etc.), it'll just come back up -- stop it at that
+supervisor level too if you actually want it to stay down.
+
 ## Tuning ignore zones: drawing past the edge, the heatmap, and event log
 
 Three features work together for diagnosing "this ignore zone isn't working"

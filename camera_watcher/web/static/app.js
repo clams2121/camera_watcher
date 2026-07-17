@@ -1,6 +1,37 @@
 (function () {
   "use strict";
 
+  // ---------- Stop server ----------
+  document.getElementById("stop-server").addEventListener("click", () => {
+    const typed = window.prompt('This stops the camera_watcher server and ends the recording process.\nType "quit" to confirm:');
+    if (typed === null) return; // cancelled
+    if (typed.trim().toLowerCase() !== "quit") {
+      window.alert('Not confirmed -- you must type exactly "quit". Nothing was stopped.');
+      return;
+    }
+
+    fetch("/api/shutdown", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: "quit" }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (ok && data.ok) {
+          document.getElementById("shutdown-banner").hidden = false;
+          document.getElementById("stop-server").disabled = true;
+        } else {
+          window.alert(data.error || "Failed to stop the server.");
+        }
+      })
+      .catch(() => {
+        // The server may have already dropped the connection while
+        // stopping -- treat that as success rather than an error.
+        document.getElementById("shutdown-banner").hidden = false;
+        document.getElementById("stop-server").disabled = true;
+      });
+  });
+
   // ---------- Tabs ----------
   const previewImg = document.getElementById("preview-img");
   let maskLoaded = false;

@@ -145,3 +145,33 @@ def test_heatmap_endpoint_serves_png_once_accumulator_exists(tmp_path):
     resp = client.post("/api/heatmap/reset")
     assert resp.status_code == 200
     assert int(pipeline.accumulator.counts.max()) == 0
+
+
+def test_shutdown_rejects_wrong_or_missing_confirmation(tmp_path, monkeypatch):
+    from camera_watcher.web import routes
+
+    calls = []
+    monkeypatch.setattr(routes, "_schedule_shutdown", lambda *a, **k: calls.append(True))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/shutdown", json={"confirm": "nope"})
+    assert resp.status_code == 400
+    assert resp.get_json()["ok"] is False
+
+    resp = client.post("/api/shutdown", json={})
+    assert resp.status_code == 400
+
+    assert calls == []  # never actually scheduled a shutdown
+
+
+def test_shutdown_accepts_case_insensitive_confirmation(tmp_path, monkeypatch):
+    from camera_watcher.web import routes
+
+    calls = []
+    monkeypatch.setattr(routes, "_schedule_shutdown", lambda *a, **k: calls.append(True))
+    client = make_client(tmp_path)
+
+    resp = client.post("/api/shutdown", json={"confirm": "QUIT"})
+    assert resp.status_code == 200
+    assert resp.get_json()["ok"] is True
+    assert calls == [True]
