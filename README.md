@@ -519,8 +519,56 @@ with each piece as it lands. Right now: a startup backfill scan plus a live
 metadata sidecar appearing -- see `clip_classifier/watcher.py`'s docstring
 for why that's a reliable "this clip is done" signal), feeding a bounded
 work queue processed serially, oldest first, with a periodic safety-net
-re-scan in case a filesystem event gets missed. `config/classifier.example.yaml`
-documents every setting.
+re-scan in case a filesystem event gets missed; frame sampling around
+motion peaks (`clip_classifier/sampling.py`); and the detector backends
+below. `config/classifier.example.yaml` documents every setting.
+
+### Detector backends
+
+`classifier.yaml`'s `backend` setting picks one:
+
+- **`cpu`** (works everywhere): YOLOv8n via ONNX Runtime. The model file is
+  never downloaded automatically -- fetch and verify it once, offline from
+  the classifier service itself:
+
+  ```bash
+  python -m clip_classifier.fetch_model
+  ```
+
+  **This repo's own pinned checksum is currently blank** (see the big
+  comment in `clip_classifier/fetch_model.py`) -- the environment this was
+  built in couldn't reach the download URL to compute and verify one. Before
+  relying on the CPU backend: from a network that *can* reach it, run
+  `python -m clip_classifier.fetch_model --print-hash-only`, confirm you
+  trust the source, and hard-code the printed SHA-256 as `MODEL_SHA256` in
+  that file. Until that's filled in, `fetch_model.py` refuses to install
+  anything as "the" model -- it fails loud rather than silently skipping
+  verification.
+
+- **`hailo`**: a Hailo-8L M.2 accelerator, if you have one. Requires all
+  three of: the device node (`/dev/hailo0`), HailoRT's Python bindings
+  (`hailo_platform`, from [Hailo's developer
+  zone](https://hailo.ai/developer-zone/)) importable in this environment,
+  and a YOLOv8-family HEF compiled for Hailo-8L (from the [Hailo Model
+  Zoo](https://github.com/hailo-ai/hailo_model_zoo)) at `hailo.hef_path` --
+  compile it **without** Hailo's built-in NMS postprocessing, so its raw
+  output shape matches the CPU backend's and both share the exact same,
+  already-tested decode logic (see `clip_classifier/detectors/hailo.py`'s
+  docstring for why, and its validation caveat -- this backend's HailoRT
+  integration was written without real Hailo-8L hardware available to test
+  it against).
+
+- **`auto`** (the default): uses Hailo if all three of the above are
+  present, otherwise falls back to CPU -- loudly, both in the logs and
+  reflected in the classifier's own status output. `backend: hailo`
+  explicitly, by contrast, never falls back -- it fails loud listing
+  exactly what's missing.
+
+Either way, detections come back as label + confidence + a normalized
+`(x, y, w, h)` box, backend-agnostic -- see `clip_classifier/detector.py`.
+Target classes for a "high" verdict: `person`, the vehicle classes (car,
+truck, bus, motorcycle, bicycle), and the COCO animal classes -- see
+`clip_classifier/labels.py`.
 
 ## Tests
 
