@@ -436,6 +436,8 @@
   const recordingVideo = document.getElementById("recording-video");
   const playingNameEl = document.getElementById("playing-name");
   const playPauseBtn = document.getElementById("play-pause");
+  const verdictFilter = document.getElementById("verdict-filter");
+  let lastGroups = [];
 
   function formatSize(bytes) {
     if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(2) + " GB";
@@ -473,6 +475,75 @@
         loadRecordings();
       })
       .catch(() => window.alert("Failed to delete the recording."));
+  }
+
+  function reviewRecording(rec, decision) {
+    fetch("/api/recordings/" + encodeURIComponent(rec.name) + "/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok || !data.ok) {
+          window.alert((data && data.error) || "Failed to record the review decision.");
+          return;
+        }
+        if (data.deleted) stopPlaybackIfShowing(rec.name);
+        loadRecordings();
+      })
+      .catch(() => window.alert("Failed to record the review decision."));
+  }
+
+  function buildReviewPanel(rec) {
+    const panel = document.createElement("div");
+    panel.className = "review-panel";
+
+    const reason = document.createElement("div");
+    reason.textContent = `Reason: ${rec.reason || "unknown"}`;
+    panel.appendChild(reason);
+
+    if (rec.labels && rec.labels.length) {
+      const labels = document.createElement("div");
+      labels.className = "review-labels";
+      labels.textContent =
+        "Top labels: " +
+        rec.labels.map((l) => `${l.label} (${Math.round((l.confidence || 0) * 100)}%)`).join(", ");
+      panel.appendChild(labels);
+    }
+
+    if (rec.reviewed) {
+      const reviewed = document.createElement("div");
+      reviewed.className = "review-labels";
+      reviewed.textContent = `Reviewed: ${rec.reviewed.decision} at ${new Date(rec.reviewed.reviewed_at).toLocaleString()}`;
+      panel.appendChild(reviewed);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "review-actions";
+
+    const keepBtn = document.createElement("button");
+    keepBtn.className = "review-keep";
+    keepBtn.textContent = "Keep";
+    keepBtn.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      reviewRecording(rec, "keep");
+    });
+
+    const discardBtn = document.createElement("button");
+    discardBtn.className = "review-discard";
+    discardBtn.textContent = "Discard";
+    discardBtn.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      if (!window.confirm(`Discard "${rec.name}"? This deletes the clip and can't be undone.`)) return;
+      reviewRecording(rec, "discard");
+    });
+
+    actions.appendChild(keepBtn);
+    actions.appendChild(discardBtn);
+    panel.appendChild(actions);
+
+    return panel;
   }
 
   function deleteRecordingGroup(group) {
@@ -516,6 +587,14 @@
     return li;
   }
 
+  function buildVerdictBadge(rec) {
+    const badge = document.createElement("span");
+    const verdict = rec.verdict || "unclassified";
+    badge.className = "verdict-badge " + verdict;
+    badge.textContent = verdict;
+    return badge;
+  }
+
   function buildRecordingRow(rec) {
     const li = document.createElement("li");
     li.className = "recording-item";
@@ -536,9 +615,37 @@
       deleteRecording(rec.name);
     });
 
+    li.appendChild(buildVerdictBadge(rec));
     li.appendChild(info);
     li.appendChild(deleteBtn);
+
+    if (rec.verdict === "review") {
+      li.appendChild(buildReviewPanel(rec));
+    }
+
     return li;
+  }
+
+  function matchesVerdictFilter(rec) {
+    const filter = verdictFilter.value;
+    if (!filter) return true;
+    if (filter === "unclassified") return !rec.verdict;
+    return rec.verdict === filter;
+  }
+
+  function renderRecordings() {
+    recordingsUl.innerHTML = "";
+    let anyVisible = false;
+    lastGroups.forEach((group) => {
+      const filtered = group.recordings.filter(matchesVerdictFilter);
+      if (filtered.length === 0) return;
+      anyVisible = true;
+      recordingsUl.appendChild(buildGroupHeader(group));
+      filtered.forEach((rec) => recordingsUl.appendChild(buildRecordingRow(rec)));
+    });
+    if (!anyVisible) {
+      recordingsUl.innerHTML = '<li class="hint">No recordings match this filter.</li>';
+    }
   }
 
   function loadRecordings() {
@@ -546,16 +653,12 @@
     fetch("/api/recordings")
       .then((r) => r.json())
       .then((data) => {
-        const groups = data.groups || [];
-        recordingsUl.innerHTML = "";
-        if (groups.length === 0) {
+        lastGroups = data.groups || [];
+        if (lastGroups.length === 0) {
           recordingsUl.innerHTML = '<li class="hint">No recordings yet.</li>';
           return;
         }
-        groups.forEach((group) => {
-          recordingsUl.appendChild(buildGroupHeader(group));
-          group.recordings.forEach((rec) => recordingsUl.appendChild(buildRecordingRow(rec)));
-        });
+        renderRecordings();
       })
       .catch(() => {
         recordingsUl.innerHTML = '<li class="hint">Failed to load recordings.</li>';
@@ -578,4 +681,5 @@
   });
 
   document.getElementById("refresh-recordings").addEventListener("click", loadRecordings);
+  verdictFilter.addEventListener("change", renderRecordings);
 })();

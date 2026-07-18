@@ -281,6 +281,140 @@ def test_delete_recording_group_rejects_malformed_bucket(tmp_path):
     assert client.delete("/api/recordings/group/2026011_1400").status_code == 404  # wrong digit count
 
 
+# ---------- Verdict / review sidecars ----------
+
+
+def test_recordings_list_reports_null_verdict_when_unclassified(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "cam_20260101_000000.mp4").write_bytes(b"x")
+
+    resp = client.get("/api/recordings")
+    rec = resp.get_json()["groups"][0]["recordings"][0]
+    assert rec["verdict"] is None
+    assert rec["reason"] is None
+    assert rec["labels"] == []
+    assert rec["reviewed"] is None
+
+
+def test_recordings_list_surfaces_verdict_reason_and_top_labels(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "cam_20260101_000000.mp4").write_bytes(b"x")
+    analysis = {
+        "verdict": "review",
+        "reason": "persistent_detection",
+        "labels": [
+            {"label": "bird", "confidence": 0.3, "frame_offset": 1.0, "box": [0, 0, 0.1, 0.1]},
+            {"label": "cat", "confidence": 0.9, "frame_offset": 2.0, "box": [0, 0, 0.1, 0.1]},
+            {"label": "dog", "confidence": 0.6, "frame_offset": 3.0, "box": [0, 0, 0.1, 0.1]},
+            {"label": "fox", "confidence": 0.5, "frame_offset": 4.0, "box": [0, 0, 0.1, 0.1]},
+        ],
+    }
+    (clips_dir / "cam_20260101_000000.analysis.json").write_text(json.dumps(analysis))
+
+    resp = client.get("/api/recordings")
+    rec = resp.get_json()["groups"][0]["recordings"][0]
+    assert rec["verdict"] == "review"
+    assert rec["reason"] == "persistent_detection"
+    # top 3 by confidence, not sidecar order
+    assert [label["label"] for label in rec["labels"]] == ["cat", "dog", "fox"]
+    assert rec["reviewed"] is None
+
+
+def test_recordings_list_surfaces_a_prior_review_decision(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "cam_20260101_000000.mp4").write_bytes(b"x")
+    review = {"reviewed_at": "2026-01-01T00:05:00+00:00", "decision": "keep"}
+    (clips_dir / "cam_20260101_000000.review.json").write_text(json.dumps(review))
+
+    resp = client.get("/api/recordings")
+    rec = resp.get_json()["groups"][0]["recordings"][0]
+    assert rec["reviewed"] == review
+
+
+def test_recordings_list_treats_unreadable_sidecars_as_absent(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "cam_20260101_000000.mp4").write_bytes(b"x")
+    (clips_dir / "cam_20260101_000000.analysis.json").write_text("{not valid json")
+
+    resp = client.get("/api/recordings")
+    rec = resp.get_json()["groups"][0]["recordings"][0]
+    assert rec["verdict"] is None
+
+
+def test_review_endpoint_keep_writes_sidecar_and_does_not_delete_the_clip(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clip = clips_dir / "cam_20260101_000000.mp4"
+    clip.write_bytes(b"x")
+
+    resp = client.post("/api/recordings/cam_20260101_000000.mp4/review", json={"decision": "keep", "note": "fine"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body == {"ok": True, "decision": "keep", "deleted": False}
+    assert clip.exists()
+
+    review_path = clips_dir / "cam_20260101_000000.review.json"
+    assert review_path.exists()
+    saved = json.loads(review_path.read_text())
+    assert saved["decision"] == "keep"
+    assert saved["note"] == "fine"
+    assert "reviewed_at" in saved
+    assert not list(clips_dir.glob("*.tmp.json"))  # atomic write leaves nothing behind
+
+
+def test_review_endpoint_discard_writes_sidecar_then_deletes_the_whole_family(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clip = clips_dir / "cam_20260101_000000.mp4"
+    clip.write_bytes(b"x")
+    metadata = clips_dir / "cam_20260101_000000.json"
+    metadata.write_text("{}")
+    analysis = clips_dir / "cam_20260101_000000.analysis.json"
+    analysis.write_text(json.dumps({"verdict": "review", "reason": "persistent_detection", "labels": []}))
+
+    resp = client.post("/api/recordings/cam_20260101_000000.mp4/review", json={"decision": "discard"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "decision": "discard", "deleted": True}
+
+    assert not clip.exists()
+    assert not metadata.exists()
+    assert not analysis.exists()
+    # review.json itself is part of the sidecar family removed on discard
+    assert not (clips_dir / "cam_20260101_000000.review.json").exists()
+
+
+def test_review_endpoint_rejects_invalid_or_missing_decision(tmp_path):
+    client = make_client(tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clip = clips_dir / "cam_20260101_000000.mp4"
+    clip.write_bytes(b"x")
+
+    resp = client.post("/api/recordings/cam_20260101_000000.mp4/review", json={"decision": "maybe"})
+    assert resp.status_code == 400
+    assert resp.get_json()["ok"] is False
+
+    resp = client.post("/api/recordings/cam_20260101_000000.mp4/review", json={})
+    assert resp.status_code == 400
+    assert clip.exists()  # never touched
+
+
+def test_review_endpoint_rejects_unknown_recording(tmp_path):
+    client = make_client(tmp_path)
+    resp = client.post("/api/recordings/does-not-exist.mp4/review", json={"decision": "keep"})
+    assert resp.status_code == 404
+
+
 # ---------- Auth ----------
 
 

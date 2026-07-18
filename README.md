@@ -622,6 +622,41 @@ the sole writer of this file; it never touches the recorder's own
   short hash of the model/HEF file, the same pattern as camera_watcher's
   own `config_hash`/`mask_hash`.
 
+### Human review (the Recordings tab)
+
+The classifier only ever writes `<stem>.analysis.json`; a human's
+keep/discard decision on a clip lives in a third, separate sidecar,
+`<stem>.review.json`:
+
+```json
+{"reviewed_at": "2026-07-17T14:35:10.002000+00:00", "decision": "keep", "note": "raccoon, not a person"}
+```
+
+`note` is optional. This file is written by `camera_watcher`'s web layer
+(`POST /api/recordings/<filename>/review`, in `camera_watcher/web/routes.py`)
+-- the classifier never writes it and never reads it back.
+
+Each per-camera web UI's Recordings tab surfaces this directly, since
+verdicts are per-camera data:
+
+- Every clip in the list gets a small **verdict badge**
+  (`high`/`review`/`low`/`error`/`unclassified` -- the last meaning
+  `clip_classifier` hasn't reached this clip yet).
+- A **verdict filter** dropdown above the list narrows it down to just one
+  verdict at a time.
+- Clips verdicted `review` get an extra panel showing the `reason`, the top
+  3 detected labels by confidence, and **Keep** / **Discard** buttons.
+  Keep writes `<stem>.review.json` with `decision: "keep"` and leaves the
+  clip alone. Discard writes the same sidecar with `decision: "discard"`
+  and then immediately deletes the clip through the same path the plain
+  Delete button uses -- removing the video and its whole sidecar family
+  (`.json`, `.analysis.json`, `.review.json`) together.
+
+`GET /api/recordings` includes `verdict`, `reason`, `labels` (top 3), and
+`reviewed` (the parsed `review.json`, or `null`) for every clip, reading
+both sidecars best-effort -- a missing or corrupt sidecar is treated as
+"not present yet" rather than an error.
+
 ## Tests
 
 ```bash

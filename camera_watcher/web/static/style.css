@@ -315,6 +315,64 @@ button[type="submit"], .mask-toolbar button {
 
 .recordings-list li.group-header:hover { background: #8882; }
 
+.verdict-filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  margin-left: auto;
+}
+
+.verdict-filter-label select { padding: 0.2rem 0.4rem; }
+
+.recordings-list li.recording-item { flex-wrap: wrap; }
+
+.verdict-badge {
+  flex: 0 0 auto;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+}
+
+.verdict-badge.high { background: #b3261e; color: white; border-color: #b3261e; }
+.verdict-badge.review { background: #b8860b; color: white; border-color: #b8860b; }
+.verdict-badge.low { background: transparent; opacity: 0.7; }
+.verdict-badge.error { background: #666; color: white; border-color: #666; }
+.verdict-badge.unclassified { background: transparent; opacity: 0.5; }
+
+.review-panel {
+  flex: 1 1 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+  padding: 0.5rem;
+  border-radius: 6px;
+  background: #8882;
+  font-size: 0.78rem;
+  cursor: default;
+}
+
+.review-labels { opacity: 0.85; }
+
+.review-actions { display: flex; gap: 0.5rem; }
+
+.review-keep, .review-discard {
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.review-keep { border: 1px solid var(--accent); background: transparent; color: var(--accent); }
+.review-keep:hover { background: var(--accent); color: white; }
+.review-discard { border: 1px solid #b3261e; background: transparent; color: #b3261e; }
+.review-discard:hover { background: #b3261e; color: white; }
+
 .recordings-player { flex: 2 1 20rem; min-width: 16rem; }
 
 #recording-video {

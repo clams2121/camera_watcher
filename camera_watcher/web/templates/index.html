@@ -104,6 +104,16 @@
         <div class="recordings-list">
           <div class="mask-toolbar">
             <button id="refresh-recordings">Refresh</button>
+            <label class="verdict-filter-label">Verdict
+              <select id="verdict-filter">
+                <option value="">All</option>
+                <option value="high">High</option>
+                <option value="review">Review</option>
+                <option value="low">Low</option>
+                <option value="error">Error</option>
+                <option value="unclassified">Unclassified</option>
+              </select>
+            </label>
           </div>
           <ul id="recordings-ul"><li class="hint">Loading...</li></ul>
         </div>
