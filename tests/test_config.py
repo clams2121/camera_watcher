@@ -78,17 +78,29 @@ def test_secrets_path_explicit_override_is_config_dir_relative(tmp_path):
 def test_rtsp_url_building_and_redaction(tmp_path):
     path = _write_config(tmp_path / "front-door.yaml")
     config = Config(path)
-    config.update_settings({"camera": {"host": "192.168.1.10", "port": 554, "path": "/stream1"}})
+    config.update_settings(
+        {"camera": {"host": "192.168.1.10", "port": 554, "main_path": "/streamMain", "sub_path": "/streamSub"}}
+    )
     config.update_secrets({"camera": {"username": "user", "password": "p@ss/word"}})
 
-    url = config.rtsp_url()
+    url = config.rtsp_url("sub")
     assert url.startswith("rtsp://user:")
     assert "p@ss/word" not in url  # must be percent-encoded, not embedded raw
-    assert "192.168.1.10:554/stream1" in url
+    assert "192.168.1.10:554/streamSub" in url
 
-    redacted = config.redacted_rtsp_url()
+    main_url = config.rtsp_url("main")
+    assert "192.168.1.10:554/streamMain" in main_url
+
+    redacted = config.redacted_rtsp_url("sub")
     assert "user" not in redacted
-    assert "192.168.1.10:554/stream1" in redacted
+    assert "192.168.1.10:554/streamSub" in redacted
+
+
+def test_rtsp_url_rejects_unknown_stream(tmp_path):
+    path = _write_config(tmp_path / "front-door.yaml")
+    config = Config(path)
+    with pytest.raises(ValueError):
+        config.rtsp_url("both")
 
 
 def test_resolved_paths_are_relative_to_config_dir_not_cwd(tmp_path, monkeypatch):
@@ -139,6 +151,21 @@ def test_event_log_path_blank_means_disabled_not_a_derived_default(tmp_path):
     path = _write_config(tmp_path / "front-door.yaml", recording={"event_log_path": ""})
     config = Config(path)
     assert config.resolved()["recording"]["event_log_path"] == ""
+
+
+def test_cache_dir_blank_derives_from_data_root_and_camera_name(tmp_path):
+    path = _write_config(tmp_path / "front-door.yaml")
+    config = Config(path)
+    resolved = config.resolved()
+    assert resolved["recording"]["cache_dir"] == str(tmp_path / "data" / "cache" / "front-door")
+    # never persisted -- the raw settings keep the sentinel
+    assert config.settings["recording"]["cache_dir"] == ""
+
+
+def test_cache_dir_explicit_override_is_config_dir_relative(tmp_path):
+    path = _write_config(tmp_path / "front-door.yaml", recording={"cache_dir": "scratch-cache"})
+    config = Config(path)
+    assert config.resolved()["recording"]["cache_dir"] == str(tmp_path / "scratch-cache")
 
 
 def test_reload_picks_up_external_edits(tmp_path):

@@ -45,9 +45,9 @@ def test_on_frame_never_blocks_and_processing_thread_consumes_it(tmp_path):
     processed = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
+    def spy(ts, motion_detected, boxes=(), **kwargs):
         processed.append(threading.current_thread().name)
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -88,9 +88,9 @@ def test_stop_drains_queued_frames_before_finalizing(tmp_path):
     processed = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
+    def spy(ts, motion_detected, boxes=(), **kwargs):
         processed.append(ts)
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 

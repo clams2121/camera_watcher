@@ -165,7 +165,8 @@ def get_stream():
             latest = pipeline.frame_buffer.latest()
             if latest is not None and latest.timestamp != last_ts:
                 last_ts = latest.timestamp
-                ok, buf = cv2.imencode(".jpg", latest.frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                frame = pipeline.frame_for_preview(latest.frame)
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if ok:
                     yield (
                         b"--frame\r\n"

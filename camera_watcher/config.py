@@ -62,7 +62,12 @@ DEFAULTS: dict[str, Any] = {
         "name": "",  # required; validated against CAMERA_NAME_RE
         "host": "",
         "port": 554,
-        "path": "/",
+        # Recorded via passthrough stream-copy -- never decoded, so its
+        # resolution/bitrate/codec don't affect CPU cost at all.
+        "main_path": "/h264Preview_01_main",
+        # Decoded for motion detection, live preview, and the mask editor
+        # snapshot -- keep this the camera's lower-resolution substream.
+        "sub_path": "/h264Preview_01_sub",
         "transport": "tcp",  # tcp or udp
     },
     "motion": {
@@ -78,12 +83,15 @@ DEFAULTS: dict[str, Any] = {
     "recording": {
         # "" = derive "<data_root>/clips/<camera.name>".
         "output_dir": "",
+        # "" = derive "<data_root>/cache/<camera.name>" -- the rolling
+        # passthrough segment cache (see segment_cache.py). Recommend
+        # mounting this on tmpfs: constant small writes, fully disposable.
+        "cache_dir": "",
+        "segment_seconds": 2,  # length of each cached passthrough segment
         "pre_buffer_seconds": 10,
         "post_buffer_seconds": 10,
         "max_chunk_seconds": 180,
         "overlap_seconds": 5,
-        "fourcc": "mp4v",
-        "max_width": 1920,
         # One JSON line per finalized clip with its motion bounding box.
         # Blank ("") disables it -- unlike the fields above, blank here does
         # NOT mean "derive a default", it means "don't write this file".
@@ -226,6 +234,11 @@ class Config:
             str(self._resolve(output_dir)) if output_dir else str(data_root / "clips" / camera_name)
         )
 
+        cache_dir = settings["recording"]["cache_dir"]
+        settings["recording"]["cache_dir"] = (
+            str(self._resolve(cache_dir)) if cache_dir else str(data_root / "cache" / camera_name)
+        )
+
         return settings
 
     def update_settings(self, patch: dict) -> dict:
@@ -246,19 +259,28 @@ class Config:
             creds = self._secrets["camera"]
             return bool(creds.get("username") or creds.get("password"))
 
-    def rtsp_url(self) -> str:
-        """Build the full RTSP URL, including credentials. Never log or display this."""
+    def rtsp_url(self, stream: str = "sub") -> str:
+        """Build the full RTSP URL for ``stream`` ("main" or "sub"), including
+        credentials. Never log or display this."""
         with self._lock:
             cam = self._settings["camera"]
             creds = self._secrets["camera"]
         user, password = creds.get("username", ""), creds.get("password", "")
         auth = f"{quote(user, safe='')}:{quote(password, safe='')}@" if (user or password) else ""
-        path = cam["path"] if cam["path"].startswith("/") else f"/{cam['path']}"
+        raw_path = cam[self._stream_field(stream)]
+        path = raw_path if raw_path.startswith("/") else f"/{raw_path}"
         return f"rtsp://{auth}{cam['host']}:{cam['port']}{path}"
 
-    def redacted_rtsp_url(self) -> str:
+    def redacted_rtsp_url(self, stream: str = "sub") -> str:
         """URL with credentials stripped, safe for logs and the UI."""
         with self._lock:
             cam = self._settings["camera"]
-        path = cam["path"] if cam["path"].startswith("/") else f"/{cam['path']}"
+        raw_path = cam[self._stream_field(stream)]
+        path = raw_path if raw_path.startswith("/") else f"/{raw_path}"
         return f"rtsp://{cam['host']}:{cam['port']}{path}"
+
+    @staticmethod
+    def _stream_field(stream: str) -> str:
+        if stream not in ("main", "sub"):
+            raise ValueError(f"stream must be 'main' or 'sub', got {stream!r}")
+        return f"{stream}_path"

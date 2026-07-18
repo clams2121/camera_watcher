@@ -11,39 +11,75 @@ of the larger project.
 
 ## How it works
 
-- A capture thread reads the RTSP stream (forced TCP transport by default)
-  and keeps a rolling, time-based buffer of the last few seconds of frames.
-- Each frame is checked for motion via background subtraction on a
-  downscaled copy, after masking out any user-defined ignore zones.
-- On motion, a recorder opens a new clip, prepends the buffered pre-roll,
-  and keeps writing through a post-motion cooldown so flaky detection
-  doesn't fragment one event into many clips.
-- Clips are capped at `max_chunk_seconds` (3 minutes by default); a forced
-  split carries `overlap_seconds` of frames into the next chunk so nothing
-  is lost across the cut.
-- Every clip is written under a temporary name and atomically renamed to its
-  final, timestamped name (`<camera>_<YYYYMMDD>_<HHMMSS>.mp4`) only once
-  fully written.
-- A background sweep enforces the configured retention policy (max age
-  and/or max total storage), only ever touching finalized clips.
-- A never-decaying motion heatmap and a per-clip event log (bounding boxes)
-  help spot spots that need a new or larger ignore zone -- see "Tuning
-  ignore zones" below.
+Each camera is read via **two independent RTSP connections**:
+
+- **Main stream** (`camera.main_path`, full resolution): never decoded.
+  ffmpeg stream-copies (`-c copy`) it straight into short, disk-resident
+  segments on a rolling basis (`recording.cache_dir`, `recording.segment_seconds`)
+  -- see `camera_watcher/segment_cache.py`. This is what actually gets
+  recorded, so a recorded clip's codec/resolution/bitrate exactly match
+  whatever the camera sent, at effectively zero CPU cost regardless of
+  resolution or bitrate.
+- **Sub stream** (`camera.sub_path`, lower resolution): decoded via OpenCV,
+  for motion detection, the live preview, and the mask editor snapshot.
+
+On motion, `camera_watcher/recorder.py` opens a time window starting
+`pre_buffer_seconds` before the trigger, keeps it open through a
+`post_buffer_seconds` cooldown after the last detected motion (so flaky
+detection doesn't fragment one event into many clips), and force-splits
+anything longer than `max_chunk_seconds` (carrying `overlap_seconds` into
+the next chunk so nothing is lost across the cut). Once a window closes, a
+background assembler thread stitches the relevant cached segments into the
+final clip via ffmpeg's concat demuxer (`camera_watcher/assemble.py`) --
+also `-c copy`, so assembly is pure stream-copy too, never touching frame
+content. Every clip is assembled under a temporary name and atomically
+renamed to its final, timestamped name (`<camera>_<YYYYMMDD>_<HHMMSS>.mp4`)
+only once fully written.
+
+A separate pruning sweep keeps the segment cache trimmed to roughly
+`pre_buffer_seconds` of lookback, and never deletes a segment that's part of
+an open event's window or an assembly job that hasn't finished yet.
+
+A background sweep enforces the configured retention policy (max age and/or
+max total storage) on finalized clips, and a never-decaying motion heatmap
+plus a per-clip event log (bounding boxes) help spot zones that need a new
+or larger ignore zone -- see "Tuning ignore zones" below.
+
+### Camera setting that matters: I-frame interval
+
+ffmpeg's segment muxer can only cut a new segment file at a keyframe, so the
+camera's own I-frame (keyframe) interval sets a floor on how precisely
+`recording.segment_seconds` is actually honored -- a long I-frame interval
+means longer, less predictable segments, and a clip's assembled start can be
+padded with several extra seconds of pre-roll it didn't ask for (harmless,
+just wasteful). **Set the camera's I-frame interval to match its frame
+rate** (i.e. one keyframe per second) so segment boundaries land close to
+where you configured them. On Reolink cameras this is under the stream's
+Encode settings ("I-Frame Interval"); set it equal to the stream's frame
+rate (e.g. `15` at 15fps).
 
 ## Threading model
 
 Every stage runs on its own thread so a slow one can never stall another,
 and the web UI stays responsive no matter what the camera is doing:
 
-- **Capture thread** only reads frames off the RTSP socket and appends them
-  to the shared pre-roll buffer -- it never touches disk.
-- **Processing thread** pulls frames off a bounded queue and does the
-  actually-slow work: motion detection and writing video to disk. It's
-  decoupled from capture specifically so a slow disk write can never back up
-  RTSP reads. If processing falls behind, the queue sheds (drops) the
-  oldest-pending frames rather than growing without bound or blocking
+- **Sub-stream capture thread** only reads frames off the RTSP socket and
+  appends them to the shared frame buffer (live preview/snapshot source) --
+  it never touches disk.
+- **Passthrough recorder** (`segment_cache.py`): a supervised ffmpeg
+  subprocess stream-copying the main stream into cached segments, with its
+  own restart-with-backoff and stall detection (no new segment for too long
+  while the process is still alive kills and restarts it).
+- **Processing thread** pulls sub-stream frames off a bounded queue and does
+  the motion detection work, decoupled from capture so a slow frame never
+  backs up RTSP reads. If processing falls behind, the queue sheds (drops)
+  the oldest-pending frames rather than growing without bound or blocking
   capture; `/api/status` reports `dropped_frames` if this happens.
-- **Retention sweep** runs on its own timer thread.
+- **Clip assembler thread**: motion-triggered ffmpeg concat calls run here,
+  never on the frame-processing thread, so assembling a clip can never stall
+  live motion detection.
+- **Cache pruner** and **retention sweep** each run on their own timer
+  thread.
 - **Web UI** (Flask) runs on the main thread with a threaded WSGI server, and
   only ever touches the shared, thread-safe frame buffer and config -- never
   the camera connection directly -- so `GET /` and the API always respond
@@ -228,17 +264,15 @@ triggering clips despite being outlined):
   "bbox": [x, y, w, h]}`. Set it to `""` to disable. Useful for scripting a
   review of which regions keep triggering recordings over time.
 
-## Bounding boxes on recorded video
+## Bounding boxes: live preview only
 
 `motion.draw_bounding_box` (off by default, toggleable from Settings) burns
-a bright green box around detected motion into recorded frames, padded
-`motion.box_padding_px` away from the contour so it doesn't obscure the
-moving object itself. It's meant as a tuning/testing aid -- turn it on while
-dialing in sensitivity and ignore zones, then back off so future recordings
-stay unannotated for any later analysis stage. It only affects frames
-recorded *after* motion starts within an event; prepended pre-roll frames
-(already captured before detection fired) are written as originally
-captured.
+a bright green box around detected motion into the **live preview stream
+only**, padded `motion.box_padding_px` away from the contour so it doesn't
+obscure the moving object itself. Recorded clips are passthrough copies of
+whatever the camera's main stream sent (`-c copy`, never decoded) and are
+never affected by this setting, at any point in the pipeline -- there's no
+frame content in the recording path to draw on in the first place.
 
 ## Companion metadata for each clip
 
