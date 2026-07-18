@@ -7,6 +7,7 @@ import threading
 import time
 
 import numpy as np
+import yaml
 
 from camera_watcher.config import Config
 from camera_watcher.pipeline import CameraPipeline
@@ -26,17 +27,20 @@ def _wait_until(predicate, timeout=3.0, interval=0.01):
 
 
 def _make_pipeline(tmp_path, **motion_overrides):
-    config = Config(tmp_path / "settings.yaml", tmp_path / "secrets.yaml")
     motion_settings = {"analysis_width": 64, "min_area": 10, "var_threshold": 16, "history": 20}
     motion_settings.update(motion_overrides)
-    config.update_settings(
-        {
-            "mask": {"path": str(tmp_path / "mask.json")},
-            "recording": {"output_dir": str(tmp_path / "clips")},
-            "motion": motion_settings,
-        }
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "192.168.1.50"},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips")},
+                "motion": motion_settings,
+            }
+        )
     )
-    pipeline = CameraPipeline(config)
+    pipeline = CameraPipeline(Config(path))
     pipeline._process_stop.clear()
     pipeline._process_thread = threading.Thread(target=pipeline._process_loop, name="frame-processor", daemon=True)
     pipeline._process_thread.start()

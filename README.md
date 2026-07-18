@@ -97,28 +97,61 @@ Then create the virtual environment as usual:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt          # add -dev.txt too if running tests
-
-cp config/secrets.yaml.example config/secrets.yaml
-# edit config/secrets.yaml with your camera's username/password
 ```
 
-`config/settings.yaml` doesn't need to be created by hand -- the first time
-the app runs, it's seeded automatically from the checked-in
-`config/settings.example.yaml`. From then on it's yours to edit directly (or
-through the web UI, which writes back to the same file); it's gitignored,
-so local changes never show up as something to commit. Only
-`settings.example.yaml` is tracked in git, documenting every option with its
-default value.
+### Configuring a camera
+
+Each camera gets its own config file, name of your choosing (letters,
+digits, `_` and `-` only -- it ends up in clip filenames):
+
+```bash
+cp config/camera.example.yaml config/front-door.yaml
+cp config/camera.secrets.example.yaml config/front-door.secrets.yaml
+# edit both: at minimum camera.name/host in front-door.yaml, and
+# camera.username/password in front-door.secrets.yaml
+```
+
+`--config` is required and must point at a real file -- nothing is
+auto-created for you here. If you point it at a path that doesn't exist,
+the app fails immediately with the exact `cp` command above rather than
+silently starting some default camera you didn't mean to configure.
 
 Run it:
 
 ```bash
-python -m camera_watcher.main
+python -m camera_watcher.main --config config/front-door.yaml
 ```
 
-Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
-Live Preview / Recordings tabs) -- from a browser **on that same machine**.
-To reach it from a different device, see Troubleshooting below.
+**Every relative path inside `front-door.yaml`** (`data_root`,
+`secrets_path`, `mask.path`, `recording.output_dir`,
+`motion.heatmap_path`, `recording.event_log_path`) resolves against the
+directory `front-door.yaml` itself lives in -- **never** against whatever
+directory you happen to run the command from. This is what makes it safe
+to run several camera processes from systemd, cron, or any working
+directory. Absolute paths work too and pass through unchanged.
+
+By default, `secrets_path` derives to `front-door.secrets.yaml` and
+`mask.path` to `front-door.mask.json`, both next to the config file;
+`recording.output_dir` derives to `<data_root>/clips/front-door`
+(`data_root` itself defaults to a `data/` directory next to the config
+file). Override any of these explicitly in the YAML if you want them
+somewhere else -- e.g. point several cameras' `data_root` at the same
+shared path so retention can sweep the whole fleet's clips from one place
+(see Retention below).
+
+Each camera needs its own `web.port` -- if two configs on the same host
+try to use the same port, the second process fails loud at startup
+("Cannot bind ... Address already in use") instead of silently stealing
+the port or failing somewhere more confusing later.
+
+Then open `http://localhost:8080` (or whatever `web.port` you set) for the
+web UI (Settings / Ignore Mask / Live Preview / Recordings tabs) -- from a
+browser **on that same machine**. To reach it from a different device, see
+Troubleshooting below.
+
+To add a second camera, repeat the `cp` steps above with a new name and a
+different `web.port`, then run a second `python -m camera_watcher.main
+--config config/<name>.yaml` process.
 
 The Recordings tab groups clips into 30-minute buckets aligned to :00/:30
 (newest group first); clicking a clip streams it in the browser with
@@ -246,38 +279,39 @@ third-party dependencies at all and can run standalone with just Python 3.
 
 ## Credentials -- please read
 
-Camera credentials are **never** stored in `config/settings.yaml` and always
-go in `config/secrets.yaml` instead, kept as a separate file so the two
-can't accidentally get mixed up. Both files are gitignored (see "Local
-config, not checked into git" below) -- neither is ever meant to be
-committed. Only `config/secrets.yaml.example` (with blank values) is tracked
-in git. The web UI's password field never echoes back the stored password --
-it always displays blank, and leaving it blank on save keeps the existing
-value.
+Camera credentials are **never** stored in `config/<name>.yaml` and always
+go in `config/<name>.secrets.yaml` instead (see `secrets_path` above if you
+want it named/located differently), kept as a separate file so the two
+can't accidentally get mixed up. Both are gitignored (see "Local config,
+not checked into git" below) -- neither is ever meant to be committed. Only
+the generic `config/camera.secrets.example.yaml` (with blank values) is
+tracked in git. The web UI's password field never echoes back the stored
+password -- it always displays blank, and leaving it blank on save keeps
+the existing value.
 
-Before committing, double check `git status` doesn't show
-`config/settings.yaml`, `config/secrets.yaml`, `config/mask.json`, or
-anything under `data/`.
+Before committing, double check `git status` doesn't show any
+`config/<name>.yaml`, `config/<name>.secrets.yaml`, `config/<name>.mask.json`,
+or anything under `data/`.
 
 ## Local config, not checked into git
 
-Everything this app writes to disk on its own -- `config/settings.yaml`,
-`config/secrets.yaml`, `config/mask.json`, the motion heatmap, event log,
-and recorded clips under `data/` -- is gitignored. Only checked-in
-*templates* live in git:
+Everything this app writes to disk on its own -- each camera's
+`config/<name>.yaml`, `config/<name>.secrets.yaml`, `config/<name>.mask.json`,
+its motion heatmap, event log, and recorded clips under `data/` -- is
+gitignored. Only checked-in *templates* live in git:
 
 | Tracked template (safe to commit) | Local file it produces (gitignored) |
 | --- | --- |
-| `config/settings.example.yaml` | `config/settings.yaml` -- auto-copied the first time the app runs, so it starts with every documented default already in place |
-| `config/mask.example.json` | `config/mask.json` -- *not* auto-copied (its sample polygon is just a format example, not a sensible default for your camera); starts with no ignore zones and is created once you draw and save your first shape |
-| `config/secrets.yaml.example` | `config/secrets.yaml` -- copy it yourself and fill in real credentials (see Setup above); there's no safe default to seed it with |
+| `config/camera.example.yaml` | `config/<name>.yaml` -- copy and edit by hand (`--config` requires it to already exist; nothing is auto-created for you, on purpose -- see Setup above) |
+| `config/camera.secrets.example.yaml` | `config/<name>.secrets.yaml` -- copy it yourself and fill in real credentials; there's no safe default to seed it with |
+| `config/camera.mask.example.json` | `config/<name>.mask.json` -- *not* auto-copied either (its sample polygon is just a format example, not a sensible default for your camera); starts with no ignore zones and is created once you draw and save your first shape |
 
 ## Configuration reference
 
-See `config/settings.example.yaml` for the full set of options with inline
+See `config/camera.example.yaml` for the full set of options with inline
 comments, covering camera connection, motion sensitivity, recording
 buffer/chunk/overlap timing, retention limits, and the web server -- your
-actual `config/settings.yaml` starts as a copy of it and has the same shape.
+actual `config/<name>.yaml` starts as a copy of it and has the same shape.
 
 ## Retention
 

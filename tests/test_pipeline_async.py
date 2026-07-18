@@ -2,6 +2,7 @@ import threading
 import time
 
 import numpy as np
+import yaml
 
 from camera_watcher.config import Config
 from camera_watcher.pipeline import CameraPipeline
@@ -21,15 +22,18 @@ def _wait_until(predicate, timeout=2.0, interval=0.01):
 
 
 def _make_pipeline(tmp_path):
-    config = Config(tmp_path / "settings.yaml", tmp_path / "secrets.yaml")
-    config.update_settings(
-        {
-            "mask": {"path": str(tmp_path / "mask.json")},
-            "recording": {"output_dir": str(tmp_path / "clips")},
-            "motion": {"enabled": False},  # isolate queue/thread plumbing from detection logic
-        }
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "192.168.1.50"},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips")},
+                "motion": {"enabled": False},  # isolate queue/thread plumbing from detection logic
+            }
+        )
     )
-    return CameraPipeline(config)
+    return CameraPipeline(Config(path))
 
 
 def test_on_frame_never_blocks_and_processing_thread_consumes_it(tmp_path):

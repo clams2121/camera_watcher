@@ -217,10 +217,15 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# camera_watcher: never commit camera credentials, locally-edited config, or captured video/state
-config/settings.yaml
-config/secrets.yaml
-config/mask.json
+# camera_watcher: never commit camera credentials, per-camera config, or captured video/state.
+# Each camera gets its own config/<name>.yaml (settings) and
+# config/<name>.secrets.yaml (credentials) -- both end in .yaml, so one
+# pattern covers both; only the generic config/camera.example.yaml template
+# is explicitly un-ignored below.
+config/*.yaml
+!config/camera.example.yaml
+!config/camera.secrets.example.yaml
+config/*.mask.json
 data/
 *.mp4
 .venv/

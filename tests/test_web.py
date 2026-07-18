@@ -1,20 +1,29 @@
 import json
 
 import numpy as np
+import yaml
 
 from camera_watcher.config import Config
 from camera_watcher.pipeline import CameraPipeline
 from camera_watcher.web import create_app
 
 
-def make_client(tmp_path):
-    config = Config(tmp_path / "settings.yaml", tmp_path / "secrets.yaml")
-    config.update_settings(
-        {
-            "mask": {"path": str(tmp_path / "mask.json")},
-            "recording": {"output_dir": str(tmp_path / "clips")},
-        }
+def _write_config(tmp_path):
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "192.168.1.50"},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips")},
+            }
+        )
     )
+    return path
+
+
+def make_client(tmp_path):
+    config = Config(_write_config(tmp_path))
     pipeline = CameraPipeline(config)
     app = create_app(config, pipeline)
     app.testing = True
@@ -22,13 +31,7 @@ def make_client(tmp_path):
 
 
 def make_client_with_pipeline(tmp_path):
-    config = Config(tmp_path / "settings.yaml", tmp_path / "secrets.yaml")
-    config.update_settings(
-        {
-            "mask": {"path": str(tmp_path / "mask.json")},
-            "recording": {"output_dir": str(tmp_path / "clips")},
-        }
-    )
+    config = Config(_write_config(tmp_path))
     pipeline = CameraPipeline(config)
     app = create_app(config, pipeline)
     app.testing = True
@@ -45,7 +48,7 @@ def test_settings_roundtrip(tmp_path):
         "/api/settings",
         json={
             "settings": {"camera": {"host": "10.0.0.9"}},
-            "credentials": {"username": "admin", "password": "secret"},
+            "credentials": {"username": "admin", "password": "hunter2"},
         },
     )
     assert resp.status_code == 200
@@ -53,7 +56,7 @@ def test_settings_roundtrip(tmp_path):
     assert body["ok"] is True
     assert body["settings"]["camera"]["host"] == "10.0.0.9"
     assert body["has_credentials"] is True
-    assert "secret" not in json.dumps(body)
+    assert "hunter2" not in json.dumps(body)  # the password itself must never round-trip back
 
 
 def test_mask_roundtrip(tmp_path):

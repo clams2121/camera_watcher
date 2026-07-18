@@ -118,7 +118,7 @@ def post_settings():
         if patch:
             config.update_secrets({"camera": patch})
 
-    pipeline.apply_settings(config.settings)
+    pipeline.apply_settings(config.resolved())
     return jsonify({"ok": True, "settings": config.settings, "has_credentials": config.has_credentials()})
 
 
@@ -181,7 +181,7 @@ def list_recordings():
     """Recordings grouped into 30-minute buckets aligned to :00/:30, newest
     group first, newest clip first within each group -- lets the UI offer a
     "delete this whole half-hour" action alongside per-clip delete."""
-    output_dir = Path(_config().settings["recording"]["output_dir"])
+    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     buckets: dict = {}
     if output_dir.exists():
         for p in output_dir.iterdir():
@@ -209,7 +209,7 @@ def _resolve_clip_path(filename: str) -> Optional[Path]:
     Returns None if the name is invalid or doesn't point at a real, finalized clip."""
     if not _CLIP_NAME_RE.match(filename) or filename.endswith(TEMP_SUFFIX):
         return None
-    output_dir = Path(_config().settings["recording"]["output_dir"]).resolve()
+    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     file_path = (output_dir / filename).resolve()
     if output_dir not in file_path.parents or not file_path.is_file():
         return None
@@ -245,7 +245,7 @@ def delete_recording_group(bucket: str):
     if not _BUCKET_RE.match(bucket):
         abort(404)
 
-    output_dir = Path(_config().settings["recording"]["output_dir"])
+    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     deleted = []
     errors = []
     if output_dir.exists():

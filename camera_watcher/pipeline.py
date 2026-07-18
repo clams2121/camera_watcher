@@ -46,7 +46,7 @@ class CameraPipeline:
 
     def __init__(self, config: Config):
         self.config = config
-        settings = config.settings
+        settings = config.resolved()
 
         rec = settings["recording"]
         buffer_seconds = max(rec["pre_buffer_seconds"], rec["overlap_seconds"]) + 2
@@ -223,7 +223,7 @@ class CameraPipeline:
         return annotated
 
     def _cleanup_orphaned_temp_files(self) -> None:
-        output_dir = Path(self.config.settings["recording"]["output_dir"])
+        output_dir = Path(self.config.resolved()["recording"]["output_dir"])
         if not output_dir.exists():
             return
         for p in output_dir.iterdir():
@@ -300,7 +300,7 @@ class CameraPipeline:
     def _start_retention_thread(self) -> None:
         def _run():
             while not self._retention_stop.is_set():
-                settings = self.config.settings
+                settings = self.config.resolved()
                 retention_cfg = settings["retention"]
                 if retention_cfg["enabled"]:
                     try:
