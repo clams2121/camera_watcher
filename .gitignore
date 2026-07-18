@@ -225,8 +225,16 @@ __marimo__/
 config/*.yaml
 !config/camera.example.yaml
 !config/camera.secrets.example.yaml
+!config/classifier.example.yaml
 config/*.mask.json
 data/
 *.mp4
 .venv/
+
+# clip_classifier: downloaded/compiled model files are large binaries with
+# their own pinned-checksum fetch step (see fetch_model.py) -- never commit
+# them.
+config/models/
+*.onnx
+*.hef
 

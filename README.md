@@ -496,6 +496,32 @@ these in order:
    than Tailscale (e.g. `127.0.0.1` for local-machine-only testing) --
    see "Network binding: Tailscale only" above.
 
+## Clip classifier (tier 1)
+
+`clip_classifier` is a separate, standalone process (its own top-level
+package, own `requirements-classifier.txt`, own systemd unit) that watches
+a camera_watcher fleet's shared `data_root` for finalized clips and writes
+a verdict sidecar (`<stem>.analysis.json`) alongside each one -- it never
+modifies the recorder or its own metadata sidecar (`<stem>.json`), only
+ever adds files of its own.
+
+```bash
+pip install -r requirements-classifier.txt
+cp config/classifier.example.yaml config/classifier.yaml
+# edit it: at minimum data_root, pointed at the same data_root your
+# camera_watcher fleet shares
+python -m clip_classifier.main --config config/classifier.yaml
+```
+
+This is under active development (see the roadmap) -- this section grows
+with each piece as it lands. Right now: a startup backfill scan plus a live
+`watchdog`-based watch for newly finalized clips (keyed off each clip's own
+metadata sidecar appearing -- see `clip_classifier/watcher.py`'s docstring
+for why that's a reliable "this clip is done" signal), feeding a bounded
+work queue processed serially, oldest first, with a periodic safety-net
+re-scan in case a filesystem event gets missed. `config/classifier.example.yaml`
+documents every setting.
+
 ## Tests
 
 ```bash
