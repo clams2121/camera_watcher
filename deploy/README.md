@@ -125,3 +125,21 @@ Removing: `sudo systemctl disable --now camera-watcher@<name>.service`, then
 delete `/opt/camera-watcher/config/<name>.{yaml,secrets.yaml,mask.json}` and
 that camera's clips under `/var/lib/camera-watcher/clips/<name>/` if you
 want them gone too (neither is automatic).
+
+## 7. Updating
+
+`update.sh` at the repo root handles the whole fleet at once -- run it as
+the `camera-watcher` user from `/opt/camera-watcher`:
+
+```bash
+sudo -u camera-watcher /opt/camera-watcher/update.sh
+```
+
+It fetches, fast-forwards (refusing to run at all against a dirty tree or a
+diverged branch), reinstalls dependencies, then restarts every
+`camera-watcher@*` instance it finds via `systemctl` and reports each one's
+resulting status -- see the root README's "Updating" section for the full
+behavior and failure modes. Since it calls `sudo systemctl restart` per
+instance, either run the whole script as root instead, or grant the
+`camera-watcher` user passwordless sudo scoped to just that command (e.g.
+via `visudo`: `camera-watcher ALL=(root) NOPASSWD: /usr/bin/systemctl restart camera-watcher@*`).

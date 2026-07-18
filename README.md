@@ -262,6 +262,45 @@ token fails startup loud, the same way a missing `camera.name` does.
   "unauthorized"}` JSON response; unauthenticated page loads redirect to
   `/login`.
 
+## Updating
+
+There's no web-UI "Update & Restart" button any more (it was
+unauthenticated remote code execution by design -- anyone who could reach
+the UI could make it pull and run arbitrary upstream code). Updates are now
+an operator-run script, `update.sh`, at the repo root:
+
+```bash
+./update.sh              # fetch, fast-forward, reinstall deps, restart every
+                          # camera-watcher@ systemd instance on this host
+./update.sh --no-fetch    # skip fetch/merge -- just reinstall deps and restart
+                          # (e.g. after updating the code some other way)
+```
+
+Deliberately conservative, the same way the old button used to be:
+
+- **Refuses a dirty working tree outright** -- commit, stash, or discard
+  first.
+- **Fast-forward only** (`git fetch` + `git merge --ff-only`) -- never
+  creates a merge commit or discards local history. If the branch has
+  diverged from upstream, it stops without touching anything and prints the
+  exact `git log` commands to look into why.
+- **Only restarts services after `pip install -r requirements.txt`
+  succeeds.** A failed dependency install leaves whatever was already
+  running under systemd alone, and prints a rollback recipe
+  (`git reset --hard <commit-before-this-run>`) rather than leaving the
+  fleet mid-update.
+- Restarts every `camera-watcher@*` instance found on the host
+  individually (not a single fleet-wide command) and prints each one's
+  post-restart status, so a restart failure on one camera is visible and
+  doesn't hide behind the others succeeding.
+- Skips the restart step entirely (with a message, not a failure) on a
+  host with no `systemctl`, or with no `camera-watcher@` instances
+  registered -- `update.sh` also works for `git clone`-only dev checkouts
+  that were never deployed as systemd services.
+
+`shellcheck update.sh` is clean; see `tests/test_update_sh.py` for
+end-to-end coverage of every path above against real throwaway git repos.
+
 ## Tuning ignore zones: drawing past the edge and the heatmap
 
 Two features work together for diagnosing "this ignore zone isn't working"
