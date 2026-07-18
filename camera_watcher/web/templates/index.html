@@ -16,12 +16,11 @@
       <button class="tab-btn" data-tab="recordings">Recordings</button>
     </nav>
     <span id="status-badge" class="status-badge">--</span>
-    <button id="update-server" class="update-btn" title="Pull the latest code from GitHub and restart">Update &amp; Restart</button>
+    <button id="logout" class="logout-btn" title="Log out of this camera's web UI">Log out</button>
     <button id="stop-server" class="danger-btn" title="Stop the camera_watcher server">Stop Server</button>
   </header>
 
   <div id="shutdown-banner" class="shutdown-banner" hidden>Server is stopping. This page will stop responding.</div>
-  <div id="update-banner" class="update-banner" hidden></div>
 
   <main>
     <section id="tab-settings" class="tab active">
@@ -31,7 +30,8 @@
           <label>Name <input name="camera.name" type="text" required></label>
           <label>Host / IP <input name="camera.host" type="text" required></label>
           <label>Port <input name="camera.port" type="number" min="1" max="65535" required></label>
-          <label>Stream path <input name="camera.path" type="text" placeholder="/stream1"></label>
+          <label>Main stream path (recorded) <input name="camera.main_path" type="text" placeholder="/h264Preview_01_main"></label>
+          <label>Sub stream path (motion/preview) <input name="camera.sub_path" type="text" placeholder="/h264Preview_01_sub"></label>
           <label>Transport
             <select name="camera.transport">
               <option value="tcp">TCP (recommended)</option>
@@ -62,12 +62,8 @@
           <label>Overlap between chunks (seconds) <input name="recording.overlap_seconds" type="number" min="0" max="60"></label>
         </fieldset>
 
-        <fieldset>
-          <legend>Retention</legend>
-          <label><input name="retention.enabled" type="checkbox"> Enabled</label>
-          <label>Max age (days) <input name="retention.max_age_days" type="number" min="0"></label>
-          <label>Max total storage (GB) <input name="retention.max_total_gb" type="number" min="0"></label>
-        </fieldset>
+        <p class="hint">Retention is configured fleet-wide, not per camera -- see
+          <code>deploy/camera-retention.service</code> / <code>.timer</code>.</p>
 
         <button type="submit">Save settings</button>
         <span id="settings-status"></span>
@@ -108,6 +104,16 @@
         <div class="recordings-list">
           <div class="mask-toolbar">
             <button id="refresh-recordings">Refresh</button>
+            <label class="verdict-filter-label">Verdict
+              <select id="verdict-filter">
+                <option value="">All</option>
+                <option value="high">High</option>
+                <option value="review">Review</option>
+                <option value="low">Low</option>
+                <option value="error">Error</option>
+                <option value="unclassified">Unclassified</option>
+              </select>
+            </label>
           </div>
           <ul id="recordings-ul"><li class="hint">Loading...</li></ul>
         </div>

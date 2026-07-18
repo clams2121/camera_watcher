@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>camera_watcher -- log in</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-body">
+  <main class="login-main">
+    <form id="login-form" class="login-form">
+      <h1>camera_watcher</h1>
+      <label>Access token
+        <input id="login-token" type="password" autocomplete="current-password" autofocus required>
+      </label>
+      <button type="submit">Log in</button>
+      <p id="login-error" class="login-error" hidden>Invalid token.</p>
+    </form>
+  </main>
+  <script>
+    (function () {
+      "use strict";
+      document.getElementById("login-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const token = document.getElementById("login-token").value;
+        const errorEl = document.getElementById("login-error");
+        errorEl.hidden = true;
+
+        fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        })
+          .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+          .then(({ ok, data }) => {
+            if (ok && data.ok) {
+              window.location.href = "/";
+            } else {
+              errorEl.hidden = false;
+            }
+          })
+          .catch(() => {
+            errorEl.textContent = "Failed to reach the server.";
+            errorEl.hidden = false;
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

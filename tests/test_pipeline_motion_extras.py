@@ -1,12 +1,15 @@
-"""Integration tests for the R3 (bounding-box burn-in) and R5 (heatmap
-accumulator) pipeline wiring -- run frames through the real motion detector
-via the pipeline's processing thread, no real camera needed.
+"""Integration tests for the R3 (bounding-box preview overlay), R5 (heatmap
+accumulator), and motion-detector-to-recorder wiring -- run frames through
+the real motion detector via the pipeline's processing thread, no real
+camera or ffmpeg needed (recorder.handle_frame is spied on and the passthrough
+segment cache/assembler are never started, so no actual clip assembly runs
+here -- that's covered end-to-end with real ffmpeg in test_recorder.py).
 """
-import json
 import threading
 import time
 
 import numpy as np
+import yaml
 
 from camera_watcher.config import Config
 from camera_watcher.pipeline import CameraPipeline
@@ -26,17 +29,20 @@ def _wait_until(predicate, timeout=3.0, interval=0.01):
 
 
 def _make_pipeline(tmp_path, **motion_overrides):
-    config = Config(tmp_path / "settings.yaml", tmp_path / "secrets.yaml")
     motion_settings = {"analysis_width": 64, "min_area": 10, "var_threshold": 16, "history": 20}
     motion_settings.update(motion_overrides)
-    config.update_settings(
-        {
-            "mask": {"path": str(tmp_path / "mask.json")},
-            "recording": {"output_dir": str(tmp_path / "clips")},
-            "motion": motion_settings,
-        }
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "192.168.1.50"},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips")},
+                "motion": motion_settings,
+            }
+        )
     )
-    pipeline = CameraPipeline(config)
+    pipeline = CameraPipeline(Config(path))
     pipeline._process_stop.clear()
     pipeline._process_thread = threading.Thread(target=pipeline._process_loop, name="frame-processor", daemon=True)
     pipeline._process_thread.start()
@@ -45,7 +51,7 @@ def _make_pipeline(tmp_path, **motion_overrides):
 
 def _warm_up_and_trigger_motion(pipeline, received, base_ts):
     # Mimics what RtspCapture._run does per frame: append to the shared
-    # pre-roll buffer, then hand off to _on_frame -- calling _on_frame alone
+    # frame buffer, then hand off to _on_frame -- calling _on_frame alone
     # (as in the async-plumbing tests) never populates frame_buffer.
     background = make_frame(0)
     for i in range(15):
@@ -65,27 +71,31 @@ def _warm_up_and_trigger_motion(pipeline, received, base_ts):
 
 
 def test_bounding_box_drawn_on_a_copy_not_the_shared_buffer_frame(tmp_path):
+    """Boxes are preview-only now (passthrough recording never decodes frame
+    content) -- frame_for_preview() must draw on a copy, never mutating what
+    sits in the shared frame buffer."""
     pipeline = _make_pipeline(tmp_path, draw_bounding_box=True, box_padding_px=2)
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
-        received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+    def spy(ts, motion_detected, boxes=(), **kwargs):
+        received.append((motion_detected, boxes))
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
     try:
         moving = _warm_up_and_trigger_motion(pipeline, received, 9000.0)
-        frame_given_to_recorder, motion_detected, boxes = received[-1]
+        motion_detected, boxes = received[-1]
         assert motion_detected
         assert boxes
 
-        # The box must be burned into a copy -- the original array (which the
-        # pre-roll frame buffer also holds a reference to) must stay pristine.
-        assert not np.array_equal(frame_given_to_recorder, moving)
         buffered = pipeline.frame_buffer.latest().frame
-        assert np.array_equal(buffered, moving)
+        assert np.array_equal(buffered, moving)  # untouched by preview drawing
+
+        preview = pipeline.frame_for_preview(buffered)
+        assert not np.array_equal(preview, moving)  # the box was actually burned into the returned copy
+        assert np.array_equal(buffered, moving)  # ...and still didn't mutate the shared buffer's frame
     finally:
         pipeline._process_stop.set()
         pipeline._process_thread.join(timeout=2)
@@ -96,18 +106,21 @@ def test_bounding_box_not_drawn_when_disabled(tmp_path):
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
-        received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+    def spy(ts, motion_detected, boxes=(), **kwargs):
+        received.append((motion_detected, boxes))
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
     try:
-        moving = _warm_up_and_trigger_motion(pipeline, received, 9500.0)
-        frame_given_to_recorder, motion_detected, boxes = received[-1]
+        _warm_up_and_trigger_motion(pipeline, received, 9500.0)
+        motion_detected, boxes = received[-1]
         assert motion_detected
-        assert boxes  # still detected/reported...
-        assert frame_given_to_recorder is moving  # ...but passed through unmodified and uncopied
+        assert boxes  # still detected/reported to the recorder for metadata purposes...
+
+        latest = pipeline.frame_buffer.latest().frame
+        preview = pipeline.frame_for_preview(latest)
+        assert preview is latest  # ...but the preview stream draws nothing when disabled
     finally:
         pipeline._process_stop.set()
         pipeline._process_thread.join(timeout=2)
@@ -118,9 +131,9 @@ def test_heatmap_accumulates_and_reset_clears_it(tmp_path):
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
-        received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+    def spy(ts, motion_detected, boxes=(), **kwargs):
+        received.append((motion_detected, boxes))
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -139,17 +152,18 @@ def test_heatmap_accumulates_and_reset_clears_it(tmp_path):
         pipeline._process_thread.join(timeout=2)
 
 
-def test_companion_metadata_written_with_real_score_and_detection_size(tmp_path):
-    """End-to-end: score/detection_fraction computed by the pipeline from the
-    real motion detector's output must reach the recorder and show up,
-    non-trivially, in the companion metadata JSON."""
+def test_pipeline_passes_real_motion_score_and_detection_size_to_the_recorder(tmp_path):
+    """End-to-end wiring check: score/detection_fraction computed by the
+    real motion detector must reach recorder.handle_frame non-trivially --
+    what the recorder then does with them (the companion metadata JSON) is
+    covered directly, with real ffmpeg assembly, in test_recorder.py."""
     pipeline = _make_pipeline(tmp_path, draw_bounding_box=False)
     received = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
-        received.append((frame, motion_detected, boxes))
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+    def spy(ts, motion_detected, boxes=(), **kwargs):
+        received.append((motion_detected, boxes, kwargs.get("score", 0), kwargs.get("detection_fraction", 0.0)))
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -157,25 +171,11 @@ def test_companion_metadata_written_with_real_score_and_detection_size(tmp_path)
         base_ts = 9900.0
         _warm_up_and_trigger_motion(pipeline, received, base_ts)
 
-        # Let the post-buffer lapse so the clip actually finalizes.
-        final_ts = base_ts + 15 * 0.1 + pipeline.recorder.config.post_buffer_seconds + 0.5
-        final_frame = make_frame(0)
-        pipeline.frame_buffer.append(final_frame, final_ts)
-        pipeline._on_frame(final_ts, final_frame)
-        assert _wait_until(lambda: len(received) == 17)
-        assert _wait_until(lambda: not pipeline.recorder.is_recording)
-
-        clips = list((tmp_path / "clips").glob("*.mp4"))
-        assert len(clips) == 1
-        metadata_path = clips[0].with_suffix(".json")
-        assert metadata_path.exists()
-
-        metadata = json.loads(metadata_path.read_text())
-        assert metadata["camera_id"] == "camera1"
-        assert metadata["video_path"] == str(clips[0].resolve())
-        assert metadata["detection_size"] > 0
-        assert metadata["motion_confidence"]["max_score"] > 0
-        assert metadata["motion_confidence"]["motion_frame_ratio"] > 0
+        motion_detected, boxes, score, detection_fraction = received[-1]
+        assert motion_detected
+        assert boxes
+        assert score > 0
+        assert detection_fraction > 0
     finally:
         pipeline._process_stop.set()
         pipeline._process_thread.join(timeout=2)

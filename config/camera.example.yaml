@@ -1,0 +1,76 @@
+# camera_watcher per-camera config template.
+#
+# This file is safe to commit -- it contains no credentials. To configure a
+# new camera, copy this file and edit the copy:
+#
+#     cp config/camera.example.yaml config/<name>.yaml
+#     cp config/camera.secrets.example.yaml config/<name>.secrets.yaml   # then fill in real credentials
+#     python -m camera_watcher.main --config config/<name>.yaml
+#
+# Every relative path in this file (data_root, secrets_path, mask.path,
+# recording.output_dir, recording.cache_dir, motion.heatmap_path) resolves
+# against the directory this file lives in -- never against whatever
+# directory you happen to run the command from. Absolute paths are also
+# fine and pass through unchanged.
+#
+# Edit by hand, or via the web UI's Settings tab, which rewrites this file
+# (and only this file -- it never touches secrets or the mask).
+
+# Shared root for this camera's output (clips, heatmap state, etc). Several
+# per-camera config files commonly point at the *same* data_root (e.g. a
+# shared /var/lib/camera-watcher/data) so retention can sweep every
+# camera's clips from one place.
+data_root: data
+
+# Where this camera's credentials live. "" derives "<camera.name>.secrets.yaml"
+# next to this file -- you only need to set this if you want it somewhere else.
+secrets_path: ""
+
+camera:
+  name: camera1 # required; letters/digits/_/- only -- used in clip filenames
+  host: ""
+  port: 554
+  # Two independent RTSP connections to the same camera:
+  main_path: /h264Preview_01_main # recorded via passthrough stream-copy -- never decoded, so its resolution/bitrate/codec don't affect CPU cost at all
+  sub_path: /h264Preview_01_sub # decoded for motion detection, live preview, and the mask editor snapshot -- keep this the camera's lower-resolution substream
+  transport: tcp # tcp or udp
+
+motion:
+  enabled: true
+  analysis_width: 320 # frames are downscaled to this width before diffing, to save CPU
+  min_area: 500 # minimum contour area (px, at analysis_width) to count as motion
+  var_threshold: 25 # MOG2 sensitivity; lower = more sensitive
+  history: 300 # number of frames of background history MOG2 considers
+  draw_bounding_box: false # burn a bright green box around detected motion into the live preview stream only -- recorded clips are passthrough copies of the camera's own stream and are never affected by this
+  box_padding_px: 12 # gap kept between the drawn box and the actual moving object, at full frame resolution
+  heatmap_path: data/motion_heatmap.npy # per-pixel motion counter that never decays; reset it from the Ignore Mask tab once you've reviewed it
+
+recording:
+  # "" derives "<data_root>/clips/<camera.name>".
+  output_dir: ""
+  # "" derives "<data_root>/cache/<camera.name>" -- the rolling passthrough
+  # segment cache that backs recording (see camera_watcher/segment_cache.py).
+  # Recommend mounting this on tmpfs: constant small writes, fully disposable.
+  cache_dir: ""
+  segment_seconds: 2 # length of each cached passthrough segment
+  pre_buffer_seconds: 10 # seconds of video kept before motion is confirmed
+  post_buffer_seconds: 10 # seconds to keep recording after motion stops
+  max_chunk_seconds: 180 # hard cap per file (3 minutes)
+  overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
+
+# Retention is NOT configured here -- it's fleet-wide, not per camera, and
+# runs externally on a schedule against the whole shared data_root. See
+# deploy/camera-retention.service + .timer + deploy/README.
+
+web:
+  # "tailscale" resolves this host's Tailscale IPv4 address at startup and
+  # binds only there -- fails loud (refuses to start) rather than falling
+  # back to 0.0.0.0 if Tailscale isn't installed/logged in. Set an explicit
+  # literal address (e.g. "127.0.0.1") to bind somewhere else instead.
+  host: tailscale
+  port: 8080 # each camera on the same host MUST use a different port -- startup fails loud on a collision
+  preview_fps: 5
+
+mask:
+  # "" derives "<camera.name>.mask.json" next to this file.
+  path: ""

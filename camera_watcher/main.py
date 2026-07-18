@@ -11,58 +11,108 @@ check_dependencies()
 
 import argparse
 import logging
-import os
 import signal
+import socket
 import sys
 
-from .config import DEFAULT_SECRETS_PATH, DEFAULT_SETTINGS_PATH, Config
+import waitress
+
+from .auth import AuthConfigError, require_token
+from .config import Config, ConfigError
 from .pipeline import CameraPipeline
+from .tailscale import TailscaleError, resolve_tailscale_ip
 from .web import create_app
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Watch an RTSP camera and record motion clips.")
-    parser.add_argument("--settings", default=str(DEFAULT_SETTINGS_PATH), help="Path to settings.yaml")
-    parser.add_argument("--secrets", default=str(DEFAULT_SECRETS_PATH), help="Path to secrets.yaml")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to this camera's config YAML (e.g. config/front-door.yaml). All relative "
+        "paths inside it resolve against its own directory, never the current working directory.",
+    )
     return parser.parse_args()
+
+
+def _check_port_available(host: str, port: int) -> None:
+    """Fails loud, with a clear message, if `port` is already bound on
+    `host` -- rather than letting the web server die moments later with a
+    lower-level, more cryptic bind error. This doesn't close the race
+    against something else grabbing the port between this check and the
+    real bind, but that's an acceptable window for a small, manually
+    managed fleet of camera processes."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as e:
+        raise ConfigError(
+            f"Cannot bind web.host={host!r} web.port={port} -- {e}.\n"
+            f"Another camera_watcher instance (or something else) is probably already using this "
+            f"port. Each camera's config needs its own web.port."
+        ) from e
+    finally:
+        sock.close()
+
+
+def _fail(message: str) -> None:
+    print(f"camera_watcher: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _resolve_host(configured_host: str) -> str:
+    """"tailscale" resolves this host's Tailscale IPv4 address and binds
+    only there; anything else is used as a literal host/IP. Never falls
+    back to 0.0.0.0 on failure -- fails loud instead."""
+    if configured_host != "tailscale":
+        return configured_host
+    try:
+        return resolve_tailscale_ip()
+    except TailscaleError as e:
+        raise ConfigError(str(e)) from e
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logger = logging.getLogger(__name__)
     args = _parse_args()
 
-    config = Config(settings_path=args.settings, secrets_path=args.secrets)
+    try:
+        config = Config(args.config)
+    except ConfigError as e:
+        _fail(str(e))
+        return  # unreachable; keeps type checkers happy about `config` below
+
+    try:
+        auth_token = require_token(config.secrets)
+    except AuthConfigError as e:
+        _fail(str(e))
+        return
+
+    web_cfg = config.settings["web"]
+    try:
+        host = _resolve_host(web_cfg["host"])
+        _check_port_available(host, web_cfg["port"])
+    except ConfigError as e:
+        _fail(str(e))
+        return
+
     pipeline = CameraPipeline(config)
     pipeline.start()
 
     def _shutdown(signum, frame):
-        logging.getLogger(__name__).info("Shutting down (signal %s)...", signum)
+        logger.info("Shutting down (signal %s)...", signum)
         pipeline.stop()
         raise SystemExit(0)
 
-    def _restart(signum, frame):
-        # Re-exec explicitly via `-m camera_watcher.main` (rather than
-        # forwarding sys.argv as-is) so relative imports still work
-        # afterwards regardless of how this process was originally launched.
-        logging.getLogger(__name__).info("Restarting to pick up updated code...")
-        pipeline.stop()
-        python = sys.executable
-        module_args = ["-m", "camera_watcher.main", "--settings", args.settings, "--secrets", args.secrets]
-        try:
-            os.execv(python, [python] + module_args)
-        except OSError:
-            logging.getLogger(__name__).exception("Restart failed; exiting instead")
-            raise SystemExit(1)
-
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
-    if hasattr(signal, "SIGUSR1"):  # not available on Windows
-        signal.signal(signal.SIGUSR1, _restart)
 
-    app = create_app(config, pipeline)
-    web_cfg = config.settings["web"]
+    app = create_app(config, pipeline, auth_token)
+    logger.info("Serving on %s:%s", host, web_cfg["port"])
     try:
-        app.run(host=web_cfg["host"], port=web_cfg["port"], threaded=True)
+        waitress.serve(app, host=host, port=web_cfg["port"], threads=8)
     finally:
         pipeline.stop()
 

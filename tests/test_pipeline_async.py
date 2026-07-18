@@ -2,6 +2,7 @@ import threading
 import time
 
 import numpy as np
+import yaml
 
 from camera_watcher.config import Config
 from camera_watcher.pipeline import CameraPipeline
@@ -21,15 +22,18 @@ def _wait_until(predicate, timeout=2.0, interval=0.01):
 
 
 def _make_pipeline(tmp_path):
-    config = Config(tmp_path / "settings.yaml", tmp_path / "secrets.yaml")
-    config.update_settings(
-        {
-            "mask": {"path": str(tmp_path / "mask.json")},
-            "recording": {"output_dir": str(tmp_path / "clips")},
-            "motion": {"enabled": False},  # isolate queue/thread plumbing from detection logic
-        }
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "192.168.1.50"},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips")},
+                "motion": {"enabled": False},  # isolate queue/thread plumbing from detection logic
+            }
+        )
     )
-    return CameraPipeline(config)
+    return CameraPipeline(Config(path))
 
 
 def test_on_frame_never_blocks_and_processing_thread_consumes_it(tmp_path):
@@ -41,9 +45,9 @@ def test_on_frame_never_blocks_and_processing_thread_consumes_it(tmp_path):
     processed = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
+    def spy(ts, motion_detected, boxes=(), **kwargs):
         processed.append(threading.current_thread().name)
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -84,9 +88,9 @@ def test_stop_drains_queued_frames_before_finalizing(tmp_path):
     processed = []
     original_handle_frame = pipeline.recorder.handle_frame
 
-    def spy(ts, frame, motion_detected, boxes=(), **kwargs):
+    def spy(ts, motion_detected, boxes=(), **kwargs):
         processed.append(ts)
-        return original_handle_frame(ts, frame, motion_detected, boxes, **kwargs)
+        return original_handle_frame(ts, motion_detected, boxes, **kwargs)
 
     pipeline.recorder.handle_frame = spy
 
@@ -97,3 +101,37 @@ def test_stop_drains_queued_frames_before_finalizing(tmp_path):
     pipeline._process_thread.join(timeout=2)
 
     assert len(processed) == 20  # nothing left unprocessed in the queue
+
+
+def test_full_lifecycle_starts_and_stops_every_thread_cleanly(tmp_path):
+    """Integration smoke test, no real camera needed: RTSP connects to a
+    port nothing is listening on and fails/retries in the background, the
+    same as against a genuinely unreachable camera. Just proves start()/
+    stop() bring up and tear down every thread (capture, frame processing,
+    passthrough segment cache, recorder assembler, cache pruner, heatmap
+    persistence -- retention is no longer one of them, see retention.py's
+    enforce_global_retention) without hanging or raising."""
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "127.0.0.1", "port": 1},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips"), "segment_seconds": 1},
+            }
+        )
+    )
+    pipeline = CameraPipeline(Config(path))
+    pipeline.start()
+    try:
+        assert _wait_until(
+            lambda: pipeline._heatmap_persist_thread is not None and pipeline._heatmap_persist_thread.is_alive()
+        )
+        assert pipeline._prune_thread is not None and pipeline._prune_thread.is_alive()
+        assert not hasattr(pipeline, "_retention_thread")
+    finally:
+        pipeline.stop()
+
+    assert not pipeline._heatmap_persist_thread.is_alive()
+    assert not pipeline._prune_thread.is_alive()
+    assert not pipeline._process_thread.is_alive()

@@ -1,0 +1,56 @@
+# clip_classifier config template.
+#
+# One classifier process watches a whole data root shared by however many
+# camera_watcher instances point at it -- not one config per camera. Copy
+# this file and edit the copy:
+#
+#     cp config/classifier.example.yaml config/classifier.yaml
+#     python -m clip_classifier.fetch_model          # downloads + verifies the CPU model
+#     python -m clip_classifier.main --config config/classifier.yaml
+#
+# Every relative path in this file (data_root, cpu.model_path,
+# hailo.hef_path) resolves against the directory this file lives in --
+# never against whatever directory you happen to run the command from.
+# Absolute paths are also fine and pass through unchanged.
+
+# Required. Point this at the SAME data_root your camera_watcher fleet
+# shares (see deploy/README.md) -- the classifier scans clips/<camera>/...
+# under here for every camera, not just one.
+data_root: /var/lib/camera-watcher
+
+# auto: use the Hailo-8L accelerator if the device and its runtime/model
+#   are all present, otherwise fall back to CPU (loudly logged either way).
+# cpu: always CPU, never even probes for Hailo.
+# hailo: always Hailo -- fails loud at startup if the device/runtime/model
+#   aren't all present, no fallback.
+backend: auto
+
+cpu:
+  # "" or a relative path -- fetched by `python -m clip_classifier.fetch_model`,
+  # which pins the download URL and verifies its SHA-256 (not configurable
+  # here -- see fetch_model.py).
+  model_path: models/yolov8n.onnx
+
+hailo:
+  # A YOLOv8-family HEF compiled for Hailo-8L. Not fetched automatically --
+  # see the README's "Hailo backend" section for where to get one from the
+  # Hailo Model Zoo and how to pin its checksum.
+  hef_path: models/yolov8n.hef
+
+thresholds:
+  high_confidence: 0.5 # verdict=high needs >= this confidence on a person/vehicle/animal detection
+  review_large_object_area_frac: 0.05 # verdict=review if any other-class detection's box covers >= this fraction of the frame
+  review_persistent_detection_frac: 0.6 # verdict=review if any detection (any class/size) appears in >= this fraction of sampled frames
+  review_persistent_motion_detection_size: 0.05 # paired with the next field: no detections at all, but the recorder's own detection_size >= this...
+  review_persistent_motion_frame_ratio: 0.6 # ...AND motion_frame_ratio >= this -> verdict=review ("large persistent motion, nothing recognized")
+
+sampling:
+  max_frames: 5 # sample at most this many frames per clip
+  min_frame_spacing_seconds: 1.0 # enforce at least this much separation between sampled timestamps
+
+watch:
+  queue_maxsize: 256
+  # Safety-net re-scan of the whole data root, in case an inotify event
+  # gets missed -- bounds how long a clip could stay invisibly
+  # unclassified without an operator noticing.
+  rescan_interval_seconds: 600

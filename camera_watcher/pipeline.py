@@ -1,4 +1,4 @@
-"""Wires capture, motion detection, recording, and retention into one running service.
+"""Wires capture, motion detection, and recording into one running service.
 
 Threading model: each stage runs on its own thread so a slow one never stalls
 another --
@@ -9,7 +9,11 @@ another --
   and does the actually-slow work: motion detection and writing video to
   disk. It's decoupled from capture via ``_frame_queue`` so a slow disk
   write never backs up the RTSP read loop.
-- The retention sweep runs on its own timer thread.
+- A small timer thread periodically persists the motion heatmap
+  accumulator. Retention is no longer an in-process thread here at all --
+  see deploy/camera-retention.service + .timer, which sweep the whole
+  fleet's shared data_root on a schedule instead (see retention.py's
+  enforce_global_retention).
 - The Flask web UI runs on the main thread (via a threaded WSGI server), so
   it keeps answering requests regardless of what the other threads are
   doing -- it never touches the camera directly, only the shared,
@@ -17,6 +21,8 @@ another --
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import queue
 import threading
@@ -33,24 +39,32 @@ from .frame_buffer import FrameBuffer
 from .mask import MaskStore
 from .motion import MotionDetector
 from .recorder import TEMP_SUFFIX, BoundingBox, RecorderConfig, SegmentRecorder
-from .retention import RetentionConfig, enforce_retention
+from .segment_cache import SegmentCache, SegmentCacheConfig
 
 logger = logging.getLogger(__name__)
 
 # BGR -- OpenCV's channel order -- for a high-contrast, easy-to-spot box.
 _BOX_COLOR = (0, 255, 0)  # bright green
 
+# The sub-stream frame buffer only feeds live preview/snapshot now --
+# recording pre-roll comes entirely from the passthrough segment cache (see
+# segment_cache.py) -- so it just needs enough headroom to smooth over
+# normal frame-interval jitter, not any particular pre/post-buffer length.
+_PREVIEW_BUFFER_SECONDS = 5.0
+
+_HEATMAP_PERSIST_INTERVAL_SECONDS = 300  # 5 minutes
+
 
 class CameraPipeline:
-    """Owns the capture thread, motion detector, recorder, and retention sweep for one camera."""
+    """Owns the capture thread, motion detector, recorder, and segment cache
+    for one camera. Retention is handled externally -- see
+    deploy/camera-retention.service + .timer."""
 
     def __init__(self, config: Config):
         self.config = config
-        settings = config.settings
+        settings = config.resolved()
 
-        rec = settings["recording"]
-        buffer_seconds = max(rec["pre_buffer_seconds"], rec["overlap_seconds"]) + 2
-        self.frame_buffer = FrameBuffer(max_seconds=buffer_seconds)
+        self.frame_buffer = FrameBuffer(max_seconds=_PREVIEW_BUFFER_SECONDS)
 
         self.mask_store = MaskStore(Path(settings["mask"]["path"]))
 
@@ -68,19 +82,29 @@ class CameraPipeline:
         self._heatmap_path = Path(motion_cfg["heatmap_path"])
         self.accumulator: Optional[MotionAccumulator] = None
 
-        self.recorder = SegmentRecorder(self.frame_buffer, self._recorder_config(settings))
+        # Live-preview-only bounding boxes from the most recently analyzed
+        # frame -- never baked into recorded video (passthrough recording
+        # never touches frame content at all). Guarded by _boxes_lock since
+        # the frame-processing thread writes it and the Flask stream route
+        # reads it from a different thread.
+        self._boxes_lock = threading.Lock()
+        self._latest_boxes: List[BoundingBox] = []
+
+        self.segment_cache = SegmentCache(
+            url_factory=lambda: self.config.rtsp_url("main"),
+            config=self._segment_cache_config(settings),
+        )
+        self.recorder = SegmentRecorder(self.segment_cache, self._recorder_config(settings))
 
         self.capture = RtspCapture(
-            url_factory=self.config.rtsp_url,
+            url_factory=lambda: self.config.rtsp_url("sub"),
             buffer=self.frame_buffer,
             transport=settings["camera"]["transport"],
             on_frame=self._on_frame,
         )
 
-        self._fps_samples: list = []
-        self._last_frame_ts: Optional[float] = None
-        self._retention_stop = threading.Event()
-        self._retention_thread: Optional[threading.Thread] = None
+        self._heatmap_persist_stop = threading.Event()
+        self._heatmap_persist_thread: Optional[threading.Thread] = None
 
         # Bounded so a stalled disk (or a burst the processing thread can't
         # keep up with) sheds frames instead of growing memory without limit.
@@ -89,37 +113,56 @@ class CameraPipeline:
         self._process_thread: Optional[threading.Thread] = None
         self._dropped_frames = 0
 
+        self._prune_stop = threading.Event()
+        self._prune_thread: Optional[threading.Thread] = None
+
     def _recorder_config(self, settings: dict) -> RecorderConfig:
         rec = settings["recording"]
-        event_log_path = rec.get("event_log_path") or None
         return RecorderConfig(
             output_dir=Path(rec["output_dir"]),
             pre_buffer_seconds=rec["pre_buffer_seconds"],
             post_buffer_seconds=rec["post_buffer_seconds"],
             max_chunk_seconds=rec["max_chunk_seconds"],
             overlap_seconds=rec["overlap_seconds"],
-            fourcc=rec["fourcc"],
-            max_width=rec["max_width"],
             camera_name=settings["camera"]["name"],
-            event_log_path=Path(event_log_path) if event_log_path else None,
+            config_hash_provider=self._config_hash,
+            mask_hash_provider=self._mask_hash,
         )
+
+    def _config_hash(self) -> str:
+        # Hashes the raw, persisted settings (not resolved() -- absolute
+        # paths would make an otherwise-identical config hash differently
+        # per machine) so a metadata sidecar can be correlated with "which
+        # config was active" across a fleet, without ever hashing secrets.
+        payload = json.dumps(self.config.settings, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
+
+    def _mask_hash(self) -> str:
+        payload = json.dumps(self.mask_store.polygons, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
+
+    def _segment_cache_config(self, settings: dict) -> SegmentCacheConfig:
+        rec = settings["recording"]
+        return SegmentCacheConfig(
+            cache_dir=Path(rec["cache_dir"]),
+            segment_seconds=rec["segment_seconds"],
+            transport=settings["camera"]["transport"],
+        )
+
+    def _cache_keep_seconds(self) -> float:
+        rec_cfg = self.recorder.config
+        # Keep enough lookback to open a fresh event's pre-buffer at any
+        # moment, plus real margin for the assembler's wait-for-segment-
+        # rollover step and general scheduling jitter.
+        return rec_cfg.pre_buffer_seconds + self.segment_cache.config.segment_seconds * 5 + 10
 
     def _on_frame(self, timestamp: float, frame: np.ndarray) -> None:
         """Called directly on the capture thread for every frame read -- must stay cheap.
 
-        Motion detection and recording (which can block on disk I/O) happen
-        on the separate processing thread instead, so a slow write can never
-        stall the RTSP read loop.
+        Motion detection and recording bookkeeping happen on the separate
+        processing thread instead, so a slow disk (writing metadata, say)
+        can never stall the RTSP read loop.
         """
-        if self._last_frame_ts is not None:
-            interval = timestamp - self._last_frame_ts
-            if 0 < interval < 1:
-                self._fps_samples.append(1.0 / interval)
-                if len(self._fps_samples) >= 30:
-                    self.recorder.set_fps_hint(sum(self._fps_samples) / len(self._fps_samples))
-                    self._fps_samples.clear()
-        self._last_frame_ts = timestamp
-
         try:
             self._frame_queue.put_nowait((timestamp, frame))
         except queue.Full:
@@ -156,14 +199,16 @@ class CameraPipeline:
                 except Exception:
                     logger.exception("Motion detection failed on a frame")
 
-            frame_to_record = frame
-            if motion_detected and boxes and self._draw_bounding_box:
-                frame_to_record = self._draw_boxes(frame, boxes)
+            # Boxes are preview-only now -- passthrough recording never
+            # decodes frame content, so there's nothing to burn them into.
+            # get_stream() (web/routes.py) reads this to draw them at serve
+            # time instead.
+            with self._boxes_lock:
+                self._latest_boxes = boxes if (motion_detected and boxes and self._draw_bounding_box) else []
 
             try:
                 self.recorder.handle_frame(
                     timestamp,
-                    frame_to_record,
                     motion_detected,
                     boxes,
                     score=score,
@@ -215,15 +260,27 @@ class CameraPipeline:
 
     def _draw_boxes(self, frame: np.ndarray, boxes: List[BoundingBox]) -> np.ndarray:
         # Draw on a copy: `frame` is the same array sitting in the shared
-        # pre-roll buffer, and mutating it in place would bake this box into
-        # whatever future clip prepends it as pre-roll.
+        # frame buffer, and mutating it in place would bake this box into
+        # every future preview frame served from that buffer entry.
         annotated = frame.copy()
         for x, y, w, h in boxes:
             cv2.rectangle(annotated, (x, y), (x + w, y + h), _BOX_COLOR, 2)
         return annotated
 
+    def frame_for_preview(self, frame: np.ndarray) -> np.ndarray:
+        """Returns `frame` with the most recently detected motion boxes
+        burned in, if bounding-box display is enabled -- used only by the
+        live MJPEG preview (web/routes.py's get_stream). Never applied to
+        recorded clips: passthrough recording never decodes frame content in
+        the first place, so there's nothing here to affect it."""
+        with self._boxes_lock:
+            boxes = list(self._latest_boxes)
+        if not boxes:
+            return frame
+        return self._draw_boxes(frame, boxes)
+
     def _cleanup_orphaned_temp_files(self) -> None:
-        output_dir = Path(self.config.settings["recording"]["output_dir"])
+        output_dir = Path(self.config.resolved()["recording"]["output_dir"])
         if not output_dir.exists():
             return
         for p in output_dir.iterdir():
@@ -236,16 +293,22 @@ class CameraPipeline:
 
     def start(self) -> None:
         self._cleanup_orphaned_temp_files()
+        self.segment_cache.start()
+        self.recorder.start()
         self._process_stop.clear()
         self._process_thread = threading.Thread(target=self._process_loop, name="frame-processor", daemon=True)
         self._process_thread.start()
         self.capture.start()
-        self._start_retention_thread()
+        self._start_heatmap_persist_thread()
+        self._start_prune_thread()
 
     def stop(self) -> None:
-        self._retention_stop.set()
-        if self._retention_thread:
-            self._retention_thread.join(timeout=5)
+        self._heatmap_persist_stop.set()
+        if self._heatmap_persist_thread:
+            self._heatmap_persist_thread.join(timeout=5)
+        self._prune_stop.set()
+        if self._prune_thread:
+            self._prune_thread.join(timeout=5)
         # Stop reading new frames first, then let the processing thread drain
         # whatever's still queued (it keeps pulling from the queue until it's
         # empty even after _process_stop is set) before finalizing the recorder.
@@ -253,7 +316,10 @@ class CameraPipeline:
         self._process_stop.set()
         if self._process_thread:
             self._process_thread.join(timeout=5)
-        self.recorder.flush_on_shutdown()
+        # recorder.stop() finishes any in-progress clip synchronously, so the
+        # segment cache backing it must still be running when it's called.
+        self.recorder.stop()
+        self.segment_cache.stop()
         if self.accumulator is not None:
             self.accumulator.save()
 
@@ -279,8 +345,8 @@ class CameraPipeline:
             self.accumulator = None  # analysis resolution may have changed too; recreate lazily
 
         self.recorder.config = self._recorder_config(settings)
-        rec = settings["recording"]
-        self.frame_buffer.set_max_seconds(max(rec["pre_buffer_seconds"], rec["overlap_seconds"]) + 2)
+        self.segment_cache.config = self._segment_cache_config(settings)
+        self.segment_cache.restart()
         self.capture.set_transport(settings["camera"]["transport"])
         self.capture.restart()
 
@@ -297,39 +363,41 @@ class CameraPipeline:
         if self.accumulator is not None:
             self.accumulator.reset()
 
-    def _start_retention_thread(self) -> None:
+    def _start_heatmap_persist_thread(self) -> None:
+        # The motion heatmap accumulator is also saved on clean shutdown and
+        # on reset -- this just keeps it from losing more than a few
+        # minutes' worth of data to an unclean stop (a crash, `kill -9`).
         def _run():
-            while not self._retention_stop.is_set():
-                settings = self.config.settings
-                retention_cfg = settings["retention"]
-                if retention_cfg["enabled"]:
-                    try:
-                        enforce_retention(
-                            RetentionConfig(
-                                output_dir=Path(settings["recording"]["output_dir"]),
-                                max_age_days=retention_cfg["max_age_days"],
-                                max_total_gb=retention_cfg["max_total_gb"],
-                            )
-                        )
-                    except Exception:
-                        logger.exception("Retention sweep failed")
-                # Piggyback the heatmap accumulator's periodic persistence on
-                # this same timer rather than running a whole extra thread
-                # for it -- it's also saved on clean shutdown and on reset.
+            while not self._heatmap_persist_stop.is_set():
                 if self.accumulator is not None:
                     try:
                         self.accumulator.save()
                     except Exception:
                         logger.exception("Failed to persist the motion heatmap accumulator")
-                interval = max(retention_cfg.get("check_interval_seconds", 3600), 60)
-                if self._retention_stop.wait(interval):
+                if self._heatmap_persist_stop.wait(_HEATMAP_PERSIST_INTERVAL_SECONDS):
                     break
 
-        self._retention_thread = threading.Thread(target=_run, name="retention", daemon=True)
-        self._retention_thread.start()
+        self._heatmap_persist_thread = threading.Thread(target=_run, name="heatmap-persist", daemon=True)
+        self._heatmap_persist_thread.start()
+
+    def _start_prune_thread(self) -> None:
+        # Separate, short-interval timer from the heatmap persistence above --
+        # the passthrough segment cache is a small rolling buffer that needs
+        # pruning every few seconds, not something swept once an hour.
+        def _run():
+            while not self._prune_stop.is_set():
+                try:
+                    self.segment_cache.prune(self._cache_keep_seconds())
+                except Exception:
+                    logger.exception("Passthrough segment cache pruning failed")
+                if self._prune_stop.wait(max(self.segment_cache.config.segment_seconds, 1.0)):
+                    break
+
+        self._prune_thread = threading.Thread(target=_run, name="cache-pruner", daemon=True)
+        self._prune_thread.start()
 
     def status(self) -> dict:
-        return {
+        status = {
             "connected": self.capture.connected,
             "recording": self.recorder.is_recording,
             "buffered_seconds": self.frame_buffer.max_seconds,
@@ -337,3 +405,5 @@ class CameraPipeline:
             "pending_frames": self._frame_queue.qsize(),
             "dropped_frames": self._dropped_frames,
         }
+        status.update(self.segment_cache.status())
+        return status

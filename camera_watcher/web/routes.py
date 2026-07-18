@@ -7,6 +7,7 @@ the running pipeline immediately, with no separate "apply" step.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -18,16 +19,31 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-from flask import Blueprint, Response, abort, current_app, jsonify, render_template, request, send_file
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    current_app,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 
+from ..auth import tokens_match
 from ..constants import TEMP_SUFFIX
-from ..update import install_dependencies, pull_latest, repo_root
 
 bp = Blueprint("camera_watcher", __name__)
 logger = logging.getLogger(__name__)
 
 _SHUTDOWN_CONFIRM_TEXT = "quit"
-_UPDATE_CONFIRM_TEXT = "update"
+
+# Reachable without a valid session/bearer token -- everything else on this
+# blueprint requires one, enforced in _require_auth below.
+_PUBLIC_ENDPOINTS = {"camera_watcher.login_page", "camera_watcher.login"}
 
 # Recording filenames are always "<camera_name>_<YYYYMMDD>_<HHMMSS>.mp4"
 # (see recorder.py) -- reject anything else outright before it ever touches
@@ -63,14 +79,46 @@ def _bucket_bounds(bucket: str):
     return start.isoformat(), end.isoformat()
 
 
-def _unlink_clip_and_metadata(file_path: Path) -> None:
-    """Removes a clip and its companion <clip stem>.json metadata file, if any."""
-    file_path.unlink()
-    metadata_path = file_path.with_suffix(".json")
+def _analysis_path(clip_path: Path) -> Path:
+    """<stem>.analysis.json -- the clip_classifier verdict sidecar, if this
+    clip has been classified yet. Never written by this process, only
+    ever read -- see clip_classifier/analysis.py for the sole writer."""
+    return clip_path.parent / f"{clip_path.stem}.analysis.json"
+
+
+def _review_path(clip_path: Path) -> Path:
+    """<stem>.review.json -- a human reviewer's keep/discard decision, if
+    any. This module is the sole writer of this one (see review_recording
+    below)."""
+    return clip_path.parent / f"{clip_path.stem}.review.json"
+
+
+def _read_json_best_effort(path: Path) -> Optional[dict]:
+    if not path.is_file():
+        return None
     try:
-        metadata_path.unlink(missing_ok=True)
-    except OSError:
-        logger.exception("Failed to remove metadata file %s", metadata_path)
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        logger.warning("Failed to read %s -- treating it as absent", path)
+        return None
+
+
+def _unlink_clip_and_metadata(file_path: Path) -> None:
+    """Removes a clip and its whole sidecar family -- the recorder's own
+    <stem>.json, and, if present, clip_classifier's <stem>.analysis.json
+    and this module's own <stem>.review.json. Each is best-effort: a
+    missing or unremovable sidecar never stops the others (or the clip
+    itself) from being deleted."""
+    file_path.unlink()
+    for sidecar_path in (
+        file_path.with_suffix(".json"),
+        _analysis_path(file_path),
+        _review_path(file_path),
+    ):
+        try:
+            sidecar_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to remove sidecar file %s", sidecar_path)
 
 
 def _config():
@@ -79,6 +127,46 @@ def _config():
 
 def _pipeline():
     return current_app.config["CAMERA_PIPELINE"]
+
+
+@bp.before_request
+def _require_auth():
+    if request.endpoint in _PUBLIC_ENDPOINTS:
+        return None
+
+    if session.get("authenticated"):
+        return None
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        candidate = auth_header[len("Bearer ") :]
+        if tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
+            return None
+
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return redirect(url_for("camera_watcher.login_page"))
+
+
+@bp.get("/login")
+def login_page():
+    return render_template("login.html")
+
+
+@bp.post("/api/login")
+def login():
+    body = request.get_json(force=True, silent=True) or {}
+    candidate = str(body.get("token", ""))
+    if not tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
+        return jsonify({"ok": False, "error": "invalid token"}), 401
+    session["authenticated"] = True
+    return jsonify({"ok": True})
+
+
+@bp.post("/api/logout")
+def logout():
+    session.pop("authenticated", None)
+    return jsonify({"ok": True})
 
 
 @bp.get("/")
@@ -118,7 +206,7 @@ def post_settings():
         if patch:
             config.update_secrets({"camera": patch})
 
-    pipeline.apply_settings(config.settings)
+    pipeline.apply_settings(config.resolved())
     return jsonify({"ok": True, "settings": config.settings, "has_credentials": config.has_credentials()})
 
 
@@ -165,7 +253,8 @@ def get_stream():
             latest = pipeline.frame_buffer.latest()
             if latest is not None and latest.timestamp != last_ts:
                 last_ts = latest.timestamp
-                ok, buf = cv2.imencode(".jpg", latest.frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                frame = pipeline.frame_for_preview(latest.frame)
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if ok:
                     yield (
                         b"--frame\r\n"
@@ -176,12 +265,34 @@ def get_stream():
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+def _recording_entry(p: Path, stat) -> dict:
+    analysis = _read_json_best_effort(_analysis_path(p))
+    review = _read_json_best_effort(_review_path(p))
+    top_labels = []
+    if analysis:
+        top_labels = sorted(analysis.get("labels") or [], key=lambda label: label.get("confidence", 0), reverse=True)[
+            :3
+        ]
+    return {
+        "name": p.name,
+        "size_bytes": stat.st_size,
+        "modified": stat.st_mtime,
+        # None (not e.g. "unclassified") when there's no analysis sidecar
+        # yet at all -- clip_classifier hasn't gotten to this clip yet,
+        # distinct from a real verdict of "low"/"high"/"review"/"error".
+        "verdict": analysis.get("verdict") if analysis else None,
+        "reason": analysis.get("reason") if analysis else None,
+        "labels": top_labels,
+        "reviewed": review,
+    }
+
+
 @bp.get("/api/recordings")
 def list_recordings():
     """Recordings grouped into 30-minute buckets aligned to :00/:30, newest
     group first, newest clip first within each group -- lets the UI offer a
     "delete this whole half-hour" action alongside per-clip delete."""
-    output_dir = Path(_config().settings["recording"]["output_dir"])
+    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     buckets: dict = {}
     if output_dir.exists():
         for p in output_dir.iterdir():
@@ -191,9 +302,7 @@ def list_recordings():
                 except OSError:
                     continue
                 key = _bucket_key(_clip_start_datetime(p, stat))
-                buckets.setdefault(key, []).append(
-                    {"name": p.name, "size_bytes": stat.st_size, "modified": stat.st_mtime}
-                )
+                buckets.setdefault(key, []).append(_recording_entry(p, stat))
 
     groups = []
     for key in sorted(buckets.keys(), reverse=True):
@@ -209,7 +318,7 @@ def _resolve_clip_path(filename: str) -> Optional[Path]:
     Returns None if the name is invalid or doesn't point at a real, finalized clip."""
     if not _CLIP_NAME_RE.match(filename) or filename.endswith(TEMP_SUFFIX):
         return None
-    output_dir = Path(_config().settings["recording"]["output_dir"]).resolve()
+    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     file_path = (output_dir / filename).resolve()
     if output_dir not in file_path.parents or not file_path.is_file():
         return None
@@ -240,12 +349,58 @@ def delete_recording(filename: str):
     return jsonify({"ok": True})
 
 
+@bp.post("/api/recordings/<filename>/review")
+def review_recording(filename: str):
+    """Records a human reviewer's keep/discard decision for a clip
+    clip_classifier flagged as "review" -- writes <stem>.review.json
+    either way; "discard" additionally deletes the clip (and its whole
+    sidecar family, review.json included) via the same path the plain
+    Delete button uses. This route is the sole writer of review.json."""
+    file_path = _resolve_clip_path(filename)
+    if file_path is None:
+        abort(404)
+
+    body = request.get_json(force=True, silent=True) or {}
+    decision = str(body.get("decision", "")).strip().lower()
+    if decision not in ("keep", "discard"):
+        return jsonify({"ok": False, "error": 'decision must be "keep" or "discard"'}), 400
+
+    review_payload = {"reviewed_at": datetime.now().astimezone().isoformat(), "decision": decision}
+    note = body.get("note")
+    if note:
+        review_payload["note"] = str(note)
+
+    review_path = _review_path(file_path)
+    try:
+        tmp_path = review_path.with_name(review_path.name[: -len(".json")] + ".tmp.json")
+        tmp_path.write_text(json.dumps(review_payload, indent=2))
+        tmp_path.replace(review_path)
+    except OSError:
+        logger.exception("Failed to write review sidecar for %s", filename)
+        return jsonify({"ok": False, "error": "failed to record the review decision"}), 500
+
+    if decision == "discard":
+        try:
+            _unlink_clip_and_metadata(file_path)
+        except OSError:
+            logger.exception("Failed to delete discarded recording %s", filename)
+            return (
+                jsonify(
+                    {"ok": False, "error": "recorded the review decision, but failed to delete the clip"}
+                ),
+                500,
+            )
+        return jsonify({"ok": True, "decision": decision, "deleted": True})
+
+    return jsonify({"ok": True, "decision": decision, "deleted": False})
+
+
 @bp.delete("/api/recordings/group/<bucket>")
 def delete_recording_group(bucket: str):
     if not _BUCKET_RE.match(bucket):
         abort(404)
 
-    output_dir = Path(_config().settings["recording"]["output_dir"])
+    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     deleted = []
     errors = []
     if output_dir.exists():
@@ -302,47 +457,3 @@ def shutdown():
     logger.warning("Shutdown requested via the web UI -- stopping the server.")
     _schedule_shutdown()
     return jsonify({"ok": True, "message": "Server is stopping."})
-
-
-def _schedule_restart(delay: float = 0.5) -> None:
-    """Send this process SIGUSR1 shortly after returning, for the same
-    flush-the-response-first reason as _schedule_shutdown. main.py handles
-    SIGUSR1 by cleanly stopping the pipeline and then re-exec'ing itself,
-    picking up whatever code is now on disk."""
-    threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGUSR1)).start()
-
-
-@bp.post("/api/update")
-def update():
-    body = request.get_json(force=True, silent=True) or {}
-    confirm = str(body.get("confirm", "")).strip().lower()
-    if confirm != _UPDATE_CONFIRM_TEXT:
-        return jsonify({"ok": False, "error": f'confirmation text must be "{_UPDATE_CONFIRM_TEXT}"'}), 400
-
-    root = repo_root()
-    pull_result, updated = pull_latest(root)
-    if not pull_result.ok:
-        logger.warning("Update: git pull failed: %s", pull_result.message)
-        return jsonify({"ok": False, "updated": False, "error": pull_result.message}), 500
-
-    if not updated:
-        return jsonify({"ok": True, "updated": False, "message": pull_result.message})
-
-    deps_result = install_dependencies(root)
-    if not deps_result.ok:
-        logger.warning("Update: dependency install failed: %s", deps_result.message)
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "updated": True,
-                    "error": "Pulled new code, but installing dependencies failed -- not restarting: "
-                    + deps_result.message,
-                }
-            ),
-            500,
-        )
-
-    logger.warning("Update requested via the web UI -- pulled latest code, restarting.")
-    _schedule_restart()
-    return jsonify({"ok": True, "updated": True, "message": "Updated. Restarting..."})

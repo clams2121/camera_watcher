@@ -1,41 +1,58 @@
-"""Motion-triggered segment recorder.
+"""Motion-triggered clip recorder -- passthrough edition.
+
+Where the old recorder wrote decoded frames straight into a ``cv2.VideoWriter``,
+this one never touches frame content for recording at all: :class:`~camera_watcher.segment_cache.SegmentCache`
+is continuously stream-copying the camera's main RTSP stream into short
+cached segments in the background, and all this class does is decide *when*
+a motion event starts and ends and hand the resulting time window off to a
+background assembler thread, which stitches the relevant cached segments
+into the final clip via the concat demuxer (also ``-c copy`` -- zero
+re-encoding, so the recorded clip's codec/resolution/bitrate exactly match
+what the camera sent).
 
 State machine, driven by calling :meth:`SegmentRecorder.handle_frame` once
-per incoming frame from a single thread:
+per analyzed frame from a single thread (the frame-processing thread -- no
+frame content is passed any more, just its timestamp and the motion
+detector's verdict for it):
 
-- IDLE, no motion: nothing is written.
-- Motion detected: a new chunk file opens, primed with ``pre_buffer_seconds``
-  of frames pulled from the shared pre-roll buffer, then live frames are
-  appended.
-- Recording continues through a ``post_buffer_seconds`` cooldown after the
-  last detected motion, so a brief gap in detection doesn't fragment one real
-  event into multiple clips.
-- A chunk longer than ``max_chunk_seconds`` is force-split into a new file,
-  carrying the last ``overlap_seconds`` of frames into the start of the next
-  chunk so nothing is lost across the cut.
-- Every chunk is written under a temporary name and atomically renamed to its
-  final, timestamped name only after the writer has cleanly closed -- a
-  reader never sees a half-written file under its final name.
+- IDLE, no motion: nothing happens.
+- Motion detected: a new event opens, its window starting
+  ``pre_buffer_seconds`` before this timestamp.
+- The event's window keeps extending through a ``post_buffer_seconds``
+  cooldown after the last detected motion, so a brief gap in detection
+  doesn't fragment one real event into multiple clips.
+- An event longer than ``max_chunk_seconds`` is force-split into a new
+  window, carrying the last ``overlap_seconds`` into the start of the next
+  one so nothing is lost across the cut.
+- Every closed window is handed to a background assembler thread -- ffmpeg
+  concat calls never block the frame-processing hot path -- which stitches
+  the relevant cached segments into the final clip under a temporary name
+  and atomically renames it only once fully written.
+- While a window is open, or its assembly job hasn't finished yet, the
+  segment cache is told never to prune anything inside it -- see
+  ``SegmentCache.protect_since``.
 """
 from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import cv2
-import numpy as np
-
+from .assemble import AssemblyError, assemble_clip, probe_video_info
 from .constants import TEMP_SUFFIX
-from .frame_buffer import FrameBuffer, TimedFrame
+from .segment_cache import SegmentCache
 
 logger = logging.getLogger(__name__)
 
 BoundingBox = Tuple[int, int, int, int]  # (x, y, w, h)
+
+METADATA_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -45,10 +62,14 @@ class RecorderConfig:
     post_buffer_seconds: float = 10
     max_chunk_seconds: float = 180
     overlap_seconds: float = 5
-    fourcc: str = "mp4v"
-    max_width: int = 1920
     camera_name: str = "camera1"
-    event_log_path: Optional[Path] = None  # JSONL log of each clip's motion bounding box; None disables it
+    # Called once, fresh, whenever a new event window opens -- captures "what
+    # config/mask was actually active for this event," not whatever's active
+    # by the time assembly gets around to running (which can be later, and on
+    # a different thread). A no-op default keeps these optional for callers
+    # (like most tests) that don't care about fleet-wide config auditing.
+    config_hash_provider: Callable[[], str] = field(default=lambda: "")
+    mask_hash_provider: Callable[[], str] = field(default=lambda: "")
 
 
 def _timestamp_name(camera_name: str, ts: float, suffix: str) -> str:
@@ -56,60 +77,73 @@ def _timestamp_name(camera_name: str, ts: float, suffix: str) -> str:
     return f"{camera_name}_{stamp}{suffix}"
 
 
-def _scale_frame(frame: np.ndarray, max_width: int) -> np.ndarray:
-    h, w = frame.shape[:2]
-    if w <= max_width:
-        return frame
-    scale = max_width / w
-    return cv2.resize(frame, (max_width, int(h * scale)))
+@dataclass
+class _Window:
+    """Per-chunk state: the time window to assemble, plus the motion stats
+    fed in per-frame by the frame-processing thread's motion detector
+    output, accumulated here for the companion metadata JSON."""
+
+    content_start_ts: float
+    chunk_start_ts: float
+    config_hash: str = ""
+    mask_hash: str = ""
+    bbox: Optional[Tuple[int, int, int, int]] = None
+    frame_count: int = 0
+    motion_frame_count: int = 0
+    score_sum: float = 0.0
+    score_count: int = 0
+    score_max: float = 0.0
+    score_max_ts: Optional[float] = None
+    max_detection_fraction: float = 0.0
+    motion_seconds: float = 0.0
+    prev_live_ts: Optional[float] = None
+    last_frame_ts: Optional[float] = None
+    # One entry per whole second offset from content_start_ts -- a coarse
+    # summary timeline, not a per-frame trace (which could be thousands of
+    # entries for a long, high-fps event).
+    timeline: Dict[int, Dict[str, object]] = field(default_factory=dict)
 
 
 class SegmentRecorder:
-    """Not thread-safe on its own -- call ``handle_frame`` from a single thread."""
+    """``handle_frame`` is not thread-safe on its own -- call it from a
+    single thread (the frame-processing thread). Assembly happens on its own
+    background thread, started/stopped via ``start``/``stop``."""
 
-    def __init__(self, pre_buffer: FrameBuffer, config: RecorderConfig, fps_hint: float = 15.0):
-        self._pre_buffer = pre_buffer
+    def __init__(self, segment_cache: SegmentCache, config: RecorderConfig):
+        self._cache = segment_cache
         self.config = config
-        self._fps_hint = fps_hint
 
         self._recording = False
-        self._writer: Optional[cv2.VideoWriter] = None
-        self._temp_path: Optional[Path] = None
-        self._final_path: Optional[Path] = None
-        self._chunk_start_ts: Optional[float] = None
+        self._window: Optional[_Window] = None
         self._last_motion_ts: Optional[float] = None
-        self._frame_size: Optional[tuple] = None
-        self._chunk_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2), full-frame coords
 
-        # Per-chunk stats accumulated for the companion metadata JSON (see
-        # _write_metadata). All reset in _open_chunk.
-        self._chunk_content_start_ts: Optional[float] = None  # earliest included frame -- "start_time" w/ pre-buffer
-        self._chunk_last_frame_ts: Optional[float] = None  # most recent frame actually written -- "end_time"
-        self._chunk_prev_live_ts: Optional[float] = None  # for measuring inter-frame gaps on live frames only
-        self._chunk_frame_count = 0
-        self._chunk_motion_frame_count = 0
-        self._chunk_score_sum = 0.0
-        self._chunk_score_count = 0
-        self._chunk_score_max = 0.0
-        self._chunk_max_detection_fraction = 0.0
-        self._chunk_motion_seconds = 0.0
+        self._state_lock = threading.Lock()
+        self._active_starts: List[float] = []  # open window's start + any not-yet-assembled jobs' starts
+
+        self._job_queue: "queue.Queue" = queue.Queue()
+        self._assembler_stop = threading.Event()
+        self._assembler_thread: Optional[threading.Thread] = None
 
     @property
     def is_recording(self) -> bool:
         return self._recording
 
-    @property
-    def current_temp_path(self) -> Optional[Path]:
-        return self._temp_path
+    def start(self) -> None:
+        self._assembler_stop.clear()
+        self._assembler_thread = threading.Thread(target=self._assemble_loop, name="clip-assembler", daemon=True)
+        self._assembler_thread.start()
 
-    def set_fps_hint(self, fps: float) -> None:
-        if fps and fps > 0:
-            self._fps_hint = fps
+    def stop(self) -> None:
+        """Finishes any in-progress event synchronously, then lets the
+        assembler thread drain whatever's already queued before stopping."""
+        self.flush_on_shutdown()
+        self._assembler_stop.set()
+        if self._assembler_thread:
+            self._assembler_thread.join(timeout=60)
 
     def handle_frame(
         self,
         timestamp: float,
-        frame: np.ndarray,
         motion_detected: bool,
         boxes: Sequence[BoundingBox] = (),
         score: float = 0,
@@ -121,166 +155,229 @@ class SegmentRecorder:
         if not self._recording:
             if not motion_detected:
                 return
-            prepend = [tf for tf in self._pre_buffer.snapshot(self.config.pre_buffer_seconds) if tf.timestamp < timestamp]
-            self._open_chunk(timestamp, prepend_frames=prepend)
+            self._open_window(timestamp)
         else:
             post_buffer_expired = (
                 self._last_motion_ts is not None
                 and timestamp - self._last_motion_ts > self.config.post_buffer_seconds
             )
             if post_buffer_expired:
-                self._finish_event()
+                self._finish_event(self._last_motion_ts + self.config.post_buffer_seconds)
                 return
 
-        self._write_frame_raw(frame)
-        self._chunk_last_frame_ts = timestamp
-        self._accumulate_bbox(boxes)
-        self._accumulate_stats(timestamp, motion_detected, score, detection_fraction)
+        self._accumulate(timestamp, motion_detected, boxes, score, detection_fraction)
 
-        if timestamp - self._chunk_start_ts >= self.config.max_chunk_seconds:
+        if timestamp - self._window.chunk_start_ts >= self.config.max_chunk_seconds:
             self._roll_chunk(timestamp)
 
-    def _accumulate_bbox(self, boxes: Sequence[BoundingBox]) -> None:
-        for x, y, w, h in boxes:
-            box = (x, y, x + w, y + h)
-            if self._chunk_bbox is None:
-                self._chunk_bbox = box
+    def _open_window(self, boundary_ts: float) -> None:
+        content_start = boundary_ts - self.config.pre_buffer_seconds
+        self._window = _Window(
+            content_start_ts=content_start,
+            chunk_start_ts=boundary_ts,
+            last_frame_ts=boundary_ts,
+            config_hash=self.config.config_hash_provider(),
+            mask_hash=self.config.mask_hash_provider(),
+        )
+        self._recording = True
+        self._register_active_start(content_start)
+        logger.info("Motion event started (window opens %.1fs before trigger)", self.config.pre_buffer_seconds)
+
+    def _accumulate(
+        self,
+        timestamp: float,
+        motion_detected: bool,
+        boxes: Sequence[BoundingBox],
+        score: float,
+        detection_fraction: float,
+    ) -> None:
+        w = self._window
+        for x, y, bw, bh in boxes:
+            box = (x, y, x + bw, y + bh)
+            if w.bbox is None:
+                w.bbox = box
             else:
-                x1, y1, x2, y2 = self._chunk_bbox
+                x1, y1, x2, y2 = w.bbox
                 bx1, by1, bx2, by2 = box
-                self._chunk_bbox = (min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2))
+                w.bbox = (min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2))
 
-    def _accumulate_stats(self, timestamp: float, motion_detected: bool, score: float, detection_fraction: float) -> None:
-        self._chunk_frame_count += 1
-
-        # Only measured between consecutive *live* frames, so pre-buffer
-        # frames (prepended in bulk in _open_chunk, before any per-frame
-        # motion status is available for them) never contribute -- they're
-        # by definition from before motion was confirmed.
-        if self._chunk_prev_live_ts is not None and motion_detected:
-            self._chunk_motion_seconds += max(timestamp - self._chunk_prev_live_ts, 0.0)
-        self._chunk_prev_live_ts = timestamp
+        w.frame_count += 1
+        if w.prev_live_ts is not None and motion_detected:
+            w.motion_seconds += max(timestamp - w.prev_live_ts, 0.0)
+        w.prev_live_ts = timestamp
+        w.last_frame_ts = timestamp
 
         if motion_detected:
-            self._chunk_motion_frame_count += 1
-            self._chunk_score_sum += score
-            self._chunk_score_count += 1
-            self._chunk_score_max = max(self._chunk_score_max, score)
+            w.motion_frame_count += 1
+            w.score_sum += score
+            w.score_count += 1
+            if score > w.score_max:
+                w.score_max = score
+                w.score_max_ts = timestamp
 
-        self._chunk_max_detection_fraction = max(self._chunk_max_detection_fraction, detection_fraction)
+        w.max_detection_fraction = max(w.max_detection_fraction, detection_fraction)
 
-    def _open_chunk(self, boundary_ts: float, prepend_frames: Optional[list] = None) -> None:
-        prepend_frames = prepend_frames or []
-        name_ts = prepend_frames[0].timestamp if prepend_frames else boundary_ts
-
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        name = _timestamp_name(self.config.camera_name, name_ts, ".mp4")
-        self._final_path = self.config.output_dir / name
-        self._temp_path = self.config.output_dir / (name + TEMP_SUFFIX)
-        self._writer = None
-        self._frame_size = None
-        self._chunk_start_ts = boundary_ts
-        self._chunk_bbox = None
-        self._recording = True
-
-        self._chunk_content_start_ts = name_ts
-        self._chunk_last_frame_ts = name_ts
-        self._chunk_prev_live_ts = None
-        self._chunk_frame_count = 0
-        self._chunk_motion_frame_count = 0
-        self._chunk_score_sum = 0.0
-        self._chunk_score_count = 0
-        self._chunk_score_max = 0.0
-        self._chunk_max_detection_fraction = 0.0
-        self._chunk_motion_seconds = 0.0
-
-        logger.info("Starting recording chunk: %s (%d prepended frames)", name, len(prepend_frames))
-
-        for tf in prepend_frames:
-            self._write_frame_raw(tf.frame)
-            self._chunk_last_frame_ts = tf.timestamp
-
-    def _write_frame_raw(self, frame: np.ndarray) -> None:
-        frame = _scale_frame(frame, self.config.max_width)
-        if self._writer is None:
-            h, w = frame.shape[:2]
-            self._frame_size = (w, h)
-            fourcc = cv2.VideoWriter_fourcc(*self.config.fourcc)
-            self._writer = cv2.VideoWriter(str(self._temp_path), fourcc, self._fps_hint, (w, h))
-        elif (frame.shape[1], frame.shape[0]) != self._frame_size:
-            frame = cv2.resize(frame, self._frame_size)
-        self._writer.write(frame)
+        bucket_t = int(timestamp - w.content_start_ts)
+        bucket = w.timeline.setdefault(bucket_t, {"score_max": 0.0, "motion_detected": False})
+        if motion_detected:
+            bucket["score_max"] = max(bucket["score_max"], score)
+            bucket["motion_detected"] = True
 
     def _roll_chunk(self, timestamp: float) -> None:
-        overlap = self._pre_buffer.snapshot(self.config.overlap_seconds)
-        overlap = [tf for tf in overlap if tf.timestamp <= timestamp]
-        self._close_chunk()
-        self._open_chunk(timestamp, prepend_frames=overlap)
-
-    def _finish_event(self) -> None:
-        self._close_chunk()
-        self._recording = False
-        self._chunk_start_ts = None
-        self._last_motion_ts = None
-
-    def _close_chunk(self) -> None:
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
-        if self._temp_path and self._temp_path.exists():
-            final_path = self._final_path
-            self._temp_path.rename(final_path)
-            logger.info("Finalized recording: %s", final_path.name)
-            self._log_event(final_path.name)
-            self._write_metadata(final_path)
-        self._temp_path = None
-        self._final_path = None
-        self._chunk_bbox = None
-
-    def _log_event(self, clip_name: str) -> None:
-        if self.config.event_log_path is None or self._chunk_bbox is None:
-            return
-        x1, y1, x2, y2 = self._chunk_bbox
-        entry = {
-            "timestamp": time.time(),
-            "camera": self.config.camera_name,
-            "clip": clip_name,
-            "bbox": [x1, y1, x2 - x1, y2 - y1],
-        }
-        try:
-            self.config.event_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.config.event_log_path.open("a") as f:
-                f.write(json.dumps(entry) + "\n")
-        except OSError:
-            logger.exception("Failed to append motion event log entry")
-
-    def _write_metadata(self, video_path: Path) -> None:
-        """Writes <video_path stem>.json alongside the clip: a companion
-        record with everything needed to review this event later without
-        opening the video itself."""
-        start_ts = self._chunk_content_start_ts
-        end_ts = self._chunk_last_frame_ts if self._chunk_last_frame_ts is not None else start_ts
-        if start_ts is None:
-            return
-
-        mean_score = self._chunk_score_sum / self._chunk_score_count if self._chunk_score_count else 0.0
-        motion_frame_ratio = (
-            self._chunk_motion_frame_count / self._chunk_frame_count if self._chunk_frame_count else 0.0
+        old_window = self._window
+        new_content_start = timestamp - self.config.overlap_seconds
+        # Register the new chunk's start *before* handing the old one off to
+        # the assembler, so the cache is never briefly unprotected between
+        # the two.
+        self._register_active_start(new_content_start)
+        self._enqueue_assembly(old_window, timestamp)
+        self._window = _Window(
+            content_start_ts=new_content_start,
+            chunk_start_ts=timestamp,
+            last_frame_ts=timestamp,
+            config_hash=self.config.config_hash_provider(),
+            mask_hash=self.config.mask_hash_provider(),
         )
 
+    def _finish_event(self, end_ts: float) -> None:
+        window = self._window
+        self._enqueue_assembly(window, end_ts)
+        self._recording = False
+        self._window = None
+        self._last_motion_ts = None
+
+    def _register_active_start(self, start_ts: float) -> None:
+        with self._state_lock:
+            self._active_starts.append(start_ts)
+            self._cache.protect_since(min(self._active_starts))
+
+    def _release_active_start(self, start_ts: float) -> None:
+        with self._state_lock:
+            self._active_starts.remove(start_ts)
+            self._cache.protect_since(min(self._active_starts) if self._active_starts else None)
+
+    def _enqueue_assembly(self, window: _Window, end_ts: float) -> None:
+        end_ts = max(end_ts, window.last_frame_ts or end_ts)
+        self._job_queue.put((window, end_ts))
+
+    def _assemble_loop(self) -> None:
+        while True:
+            try:
+                item = self._job_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._assembler_stop.is_set():
+                    return
+                continue
+            window, end_ts = item
+            try:
+                self._process_job(window, end_ts)
+            except Exception:
+                logger.exception("Failed to assemble a recorded clip")
+            finally:
+                self._release_active_start(window.content_start_ts)
+
+    def _process_job(self, window: _Window, end_ts: float) -> None:
+        # The cached segment covering `end_ts` may still be actively being
+        # written by ffmpeg (it writes each segment file in place until the
+        # next segment boundary) -- wait for a newer segment to appear before
+        # assembling, without blocking the frame-processing thread (we're on
+        # our own thread here).
+        segment_seconds = self._cache.config.segment_seconds
+        deadline = time.time() + segment_seconds + 2.0
+        while time.time() < deadline and not self._assembler_stop.is_set():
+            newest = self._cache.newest_segment_start()
+            if newest is not None and newest > end_ts:
+                break
+            time.sleep(0.25)
+
+        segments = self._cache.list_segments(window.content_start_ts, end_ts)
+        if not segments:
+            logger.error(
+                "No cached segments covered the window [%.3f, %.3f) -- dropping this event "
+                "(cache_dir may be too small for pre_buffer_seconds, or the passthrough recorder "
+                "was disconnected for the whole event)",
+                window.content_start_ts,
+                end_ts,
+            )
+            return
+
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        name = _timestamp_name(self.config.camera_name, window.content_start_ts, ".mp4")
+        final_path = self.config.output_dir / name
+        temp_path = self.config.output_dir / (name + TEMP_SUFFIX)
+
+        try:
+            assemble_clip(segments, temp_path)
+        except AssemblyError:
+            logger.exception("Clip assembly failed for %s", name)
+            temp_path.unlink(missing_ok=True)
+            return
+
+        temp_path.rename(final_path)
+        logger.info("Finalized recording: %s (%d segment(s))", final_path.name, len(segments))
+        self._write_metadata(final_path, window, end_ts)
+
+    def _write_metadata(self, video_path: Path, window: _Window, end_ts: float) -> None:
+        """Writes <video_path stem>.json alongside the clip: the single,
+        complete record of this event -- there's no separate motion-events
+        log any more (schema v2 folds everything, including the bounding
+        box, in here)."""
+        start_ts = window.content_start_ts
+        mean_score = window.score_sum / window.score_count if window.score_count else 0.0
+        motion_frame_ratio = window.motion_frame_count / window.frame_count if window.frame_count else 0.0
+
+        # Real, ffprobe'd values for the assembled file -- segment boundaries
+        # are keyframe-aligned, so the actual content span can differ
+        # slightly from [start_ts, end_ts). Best-effort: a probe failure
+        # shouldn't cost the clip itself, only these two fields.
+        resolution = None
+        duration_seconds = None
+        try:
+            info = probe_video_info(video_path)
+            resolution = [info.width, info.height]
+            duration_seconds = round(info.duration_seconds, 3)
+        except Exception:
+            logger.exception("Failed to probe %s for resolution/duration", video_path.name)
+
+        live_span = (window.last_frame_ts - window.chunk_start_ts) if window.last_frame_ts is not None else 0.0
+        sub_fps_measured = round((window.frame_count - 1) / live_span, 2) if live_span > 0 else None
+
+        peak_motion_time = (
+            datetime.fromtimestamp(window.score_max_ts).astimezone().isoformat()
+            if window.score_max_ts is not None
+            else None
+        )
+        motion_timeline = [
+            {"t": t, "score": round(bucket["score_max"], 4), "motion_detected": bucket["motion_detected"]}
+            for t, bucket in sorted(window.timeline.items())
+        ]
+        bounding_box = None
+        if window.bbox is not None:
+            x1, y1, x2, y2 = window.bbox
+            bounding_box = [x1, y1, x2 - x1, y2 - y1]
+
         metadata = {
+            "schema_version": METADATA_SCHEMA_VERSION,
             "event_id": video_path.stem,
             "camera_id": self.config.camera_name,
             "start_time": datetime.fromtimestamp(start_ts).astimezone().isoformat(),
             "end_time": datetime.fromtimestamp(end_ts).astimezone().isoformat(),
+            "duration_seconds": duration_seconds,
             "video_path": str(video_path.resolve()),
+            "resolution": resolution,
+            "bounding_box": bounding_box,
             "motion_confidence": {
                 "mean_score": round(mean_score, 4),
-                "max_score": round(self._chunk_score_max, 4),
+                "max_score": round(window.score_max, 4),
                 "motion_frame_ratio": round(motion_frame_ratio, 4),
             },
-            "motion_time": round(self._chunk_motion_seconds, 4),
-            "detection_size": round(self._chunk_max_detection_fraction, 4),
+            "motion_time": round(window.motion_seconds, 4),
+            "detection_size": round(window.max_detection_fraction, 4),
+            "peak_motion_time": peak_motion_time,
+            "motion_timeline": motion_timeline,
+            "sub_fps_measured": sub_fps_measured,
+            "config_hash": window.config_hash,
+            "mask_hash": window.mask_hash,
         }
 
         metadata_path = video_path.with_suffix(".json")
@@ -293,6 +390,18 @@ class SegmentRecorder:
             logger.exception("Failed to write metadata for %s", video_path.name)
 
     def flush_on_shutdown(self) -> None:
-        """Cleanly close any in-progress recording, e.g. during process shutdown."""
-        if self._recording:
-            self._finish_event()
+        """Synchronously finishes any in-progress event so a clean shutdown
+        doesn't drop the tail of a recording. Must run before the segment
+        cache backing it is stopped."""
+        if self._recording and self._window is not None:
+            window = self._window
+            end_ts = window.last_frame_ts or window.chunk_start_ts
+            self._recording = False
+            self._window = None
+            self._last_motion_ts = None
+            try:
+                self._process_job(window, end_ts)
+            except Exception:
+                logger.exception("Failed to assemble the in-progress clip during shutdown")
+            finally:
+                self._release_active_start(window.content_start_ts)
