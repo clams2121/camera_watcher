@@ -100,7 +100,11 @@ DEFAULTS: dict[str, Any] = {
         "check_interval_seconds": 3600,
     },
     "web": {
-        "host": "0.0.0.0",
+        # "tailscale" resolves this host's Tailscale IPv4 address at startup
+        # (see tailscale.py) and binds only there -- fails loud rather than
+        # falling back to 0.0.0.0 if that can't be resolved. Set an explicit
+        # literal host (e.g. "127.0.0.1") to bypass Tailscale entirely.
+        "host": "tailscale",
         "port": 8080,
         "preview_fps": 5,
     },
@@ -110,8 +114,9 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
-# Only the camera credentials are considered secret.
-SECRET_DEFAULTS: dict[str, Any] = {"camera": {"username": "", "password": ""}}
+# Camera credentials and the web UI's auth token -- never logged, never
+# round-tripped through the settings API.
+SECRET_DEFAULTS: dict[str, Any] = {"camera": {"username": "", "password": ""}, "web": {"auth_token": ""}}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

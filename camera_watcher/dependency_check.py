@@ -16,6 +16,7 @@ REQUIRED_PACKAGES = [
     ("numpy", "numpy"),
     ("flask", "Flask"),
     ("yaml", "PyYAML"),
+    ("waitress", "waitress"),
 ]
 
 

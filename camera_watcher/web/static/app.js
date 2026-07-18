@@ -32,66 +32,25 @@
       });
   });
 
-  // ---------- Update & restart ----------
-  function waitForServerAndReload(banner) {
-    const poll = () => {
-      fetch("/api/status", { cache: "no-store" })
-        .then((r) => {
-          if (r.ok) location.reload();
-          else setTimeout(poll, 2000);
-        })
-        .catch(() => setTimeout(poll, 2000));
-    };
-    // Give the old process a moment to actually exit before the first poll,
-    // so we don't just immediately hit the still-running old version.
-    setTimeout(poll, 3000);
-  }
-
-  document.getElementById("update-server").addEventListener("click", () => {
-    const typed = window.prompt(
-      "This pulls the latest code from GitHub, reinstalls dependencies if needed, and restarts the server.\n" +
-        'Type "update" to confirm:'
-    );
-    if (typed === null) return; // cancelled
-    if (typed.trim().toLowerCase() !== "update") {
-      window.alert('Not confirmed -- you must type exactly "update". Nothing was changed.');
-      return;
-    }
-
-    const banner = document.getElementById("update-banner");
-    const btn = document.getElementById("update-server");
-    btn.disabled = true;
-    banner.textContent = "Checking for updates...";
-    banner.hidden = false;
-
-    fetch("/api/update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ confirm: "update" }),
-    })
-      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
-      .then(({ ok, data }) => {
-        if (!ok || !data.ok) {
-          banner.hidden = true;
-          btn.disabled = false;
-          window.alert((data && data.error) || "Update failed.");
-          return;
-        }
-        if (!data.updated) {
-          banner.hidden = true;
-          btn.disabled = false;
-          window.alert(data.message || "Already up to date.");
-          return;
-        }
-        banner.textContent = "Updated -- restarting with the latest code. This page will reload automatically.";
-        waitForServerAndReload(banner);
-      })
-      .catch(() => {
-        window.alert("Failed to reach the server to request an update.");
-        banner.hidden = true;
-        btn.disabled = false;
-      });
+  // ---------- Logout ----------
+  document.getElementById("logout").addEventListener("click", () => {
+    fetch("/api/logout", { method: "POST" }).finally(() => {
+      window.location.href = "/login";
+    });
   });
+
+  // If a session expires (or the token rotates) mid-page, any API call will
+  // start coming back 401 -- bounce to the login page rather than leaving
+  // the UI silently broken.
+  const _fetch = window.fetch;
+  window.fetch = function (...args) {
+    return _fetch.apply(this, args).then((response) => {
+      if (response.status === 401 && !String(args[0]).startsWith("/api/login")) {
+        window.location.href = "/login";
+      }
+      return response;
+    });
+  };
 
   // ---------- Tabs ----------
   const previewImg = document.getElementById("preview-img");

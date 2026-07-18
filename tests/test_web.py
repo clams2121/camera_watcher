@@ -7,6 +7,8 @@ from camera_watcher.config import Config
 from camera_watcher.pipeline import CameraPipeline
 from camera_watcher.web import create_app
 
+AUTH_TOKEN = "x" * 40
+
 
 def _write_config(tmp_path):
     path = tmp_path / "camera1.yaml"
@@ -22,20 +24,30 @@ def _write_config(tmp_path):
     return path
 
 
-def make_client(tmp_path):
+def _make_app(tmp_path):
     config = Config(_write_config(tmp_path))
     pipeline = CameraPipeline(config)
-    app = create_app(config, pipeline)
+    app = create_app(config, pipeline, AUTH_TOKEN)
     app.testing = True
-    return app.test_client()
+    return app, pipeline
+
+
+def make_client(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    # Flask's test client persists cookies across requests, so logging in
+    # once here authenticates every subsequent call these tests make.
+    resp = client.post("/api/login", json={"token": AUTH_TOKEN})
+    assert resp.status_code == 200
+    return client
 
 
 def make_client_with_pipeline(tmp_path):
-    config = Config(_write_config(tmp_path))
-    pipeline = CameraPipeline(config)
-    app = create_app(config, pipeline)
-    app.testing = True
-    return app.test_client(), pipeline
+    app, pipeline = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/login", json={"token": AUTH_TOKEN})
+    assert resp.status_code == 200
+    return client, pipeline
 
 
 def test_settings_roundtrip(tmp_path):
@@ -269,87 +281,73 @@ def test_delete_recording_group_rejects_malformed_bucket(tmp_path):
     assert client.delete("/api/recordings/group/2026011_1400").status_code == 404  # wrong digit count
 
 
-def test_update_rejects_wrong_confirmation_without_touching_git(tmp_path, monkeypatch):
-    from camera_watcher.web import routes
+# ---------- Auth ----------
 
-    calls = []
-    monkeypatch.setattr(routes, "pull_latest", lambda *a, **k: calls.append("pull"))
-    client = make_client(tmp_path)
 
-    resp = client.post("/api/update", json={"confirm": "nope"})
-    assert resp.status_code == 400
+def test_unauthenticated_api_request_gets_401_json(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.get("/api/status")
+    assert resp.status_code == 401
     assert resp.get_json()["ok"] is False
-    assert calls == []
 
 
-def test_update_reports_up_to_date_without_restarting(tmp_path, monkeypatch):
-    from camera_watcher.update import CommandResult
-    from camera_watcher.web import routes
+def test_unauthenticated_page_request_redirects_to_login(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["Location"].endswith("/login")
 
-    monkeypatch.setattr(routes, "pull_latest", lambda root: (CommandResult(True, "Already up to date."), False))
-    restart_calls = []
-    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
-    client = make_client(tmp_path)
 
-    resp = client.post("/api/update", json={"confirm": "update"})
+def test_login_page_itself_is_reachable_unauthenticated(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.get("/login")
     assert resp.status_code == 200
-    body = resp.get_json()
-    assert body["ok"] is True
-    assert body["updated"] is False
-    assert restart_calls == []
 
 
-def test_update_reports_pull_failure_without_restarting(tmp_path, monkeypatch):
-    from camera_watcher.update import CommandResult
-    from camera_watcher.web import routes
+def test_login_with_wrong_token_is_rejected(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/login", json={"token": "wrong"})
+    assert resp.status_code == 401
+    assert resp.get_json()["ok"] is False
 
-    monkeypatch.setattr(
-        routes, "pull_latest", lambda root: (CommandResult(False, "fatal: not a fast-forward"), False)
-    )
-    restart_calls = []
-    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
-    client = make_client(tmp_path)
-
-    resp = client.post("/api/update", json={"confirm": "update"})
-    assert resp.status_code == 500
-    body = resp.get_json()
-    assert body["ok"] is False
-    assert "fast-forward" in body["error"]
-    assert restart_calls == []
+    # still unauthenticated -- a failed login attempt must not grant a session
+    assert client.get("/api/status").status_code == 401
 
 
-def test_update_reports_dependency_install_failure_without_restarting(tmp_path, monkeypatch):
-    from camera_watcher.update import CommandResult
-    from camera_watcher.web import routes
-
-    monkeypatch.setattr(routes, "pull_latest", lambda root: (CommandResult(True, "Fast-forwarded."), True))
-    monkeypatch.setattr(routes, "install_dependencies", lambda root: CommandResult(False, "pip explosion"))
-    restart_calls = []
-    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
-    client = make_client(tmp_path)
-
-    resp = client.post("/api/update", json={"confirm": "UPDATE"})  # case-insensitive
-    assert resp.status_code == 500
-    body = resp.get_json()
-    assert body["ok"] is False
-    assert body["updated"] is True
-    assert "pip explosion" in body["error"]
-    assert restart_calls == []
-
-
-def test_update_succeeds_and_schedules_restart(tmp_path, monkeypatch):
-    from camera_watcher.update import CommandResult
-    from camera_watcher.web import routes
-
-    monkeypatch.setattr(routes, "pull_latest", lambda root: (CommandResult(True, "Fast-forwarded."), True))
-    monkeypatch.setattr(routes, "install_dependencies", lambda root: CommandResult(True, "Dependencies installed."))
-    restart_calls = []
-    monkeypatch.setattr(routes, "_schedule_restart", lambda *a, **k: restart_calls.append(True))
-    client = make_client(tmp_path)
-
-    resp = client.post("/api/update", json={"confirm": "update"})
+def test_login_with_correct_token_grants_a_session(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/login", json={"token": AUTH_TOKEN})
     assert resp.status_code == 200
-    body = resp.get_json()
-    assert body["ok"] is True
-    assert body["updated"] is True
-    assert restart_calls == [True]
+    assert resp.get_json()["ok"] is True
+
+    assert client.get("/api/status").status_code == 200
+    assert client.get("/").status_code == 200
+
+
+def test_logout_clears_the_session(tmp_path):
+    client = make_client(tmp_path)  # logged in
+    assert client.get("/api/status").status_code == 200
+
+    resp = client.post("/api/logout")
+    assert resp.status_code == 200
+
+    assert client.get("/api/status").status_code == 401
+
+
+def test_bearer_token_authenticates_without_a_session(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()  # never logged in -- no session cookie at all
+    resp = client.get("/api/status", headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
+    assert resp.status_code == 200
+
+
+def test_wrong_bearer_token_is_rejected(tmp_path):
+    app, _ = _make_app(tmp_path)
+    client = app.test_client()
+    resp = client.get("/api/status", headers={"Authorization": "Bearer wrong-token"})
+    assert resp.status_code == 401

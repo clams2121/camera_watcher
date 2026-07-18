@@ -65,7 +65,11 @@ retention:
   check_interval_seconds: 3600
 
 web:
-  host: 0.0.0.0
+  # "tailscale" resolves this host's Tailscale IPv4 address at startup and
+  # binds only there -- fails loud (refuses to start) rather than falling
+  # back to 0.0.0.0 if Tailscale isn't installed/logged in. Set an explicit
+  # literal address (e.g. "127.0.0.1") to bind somewhere else instead.
+  host: tailscale
   port: 8080 # each camera on the same host MUST use a different port -- startup fails loud on a collision
   preview_fps: 5
 

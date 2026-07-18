@@ -11,13 +11,16 @@ check_dependencies()
 
 import argparse
 import logging
-import os
 import signal
 import socket
 import sys
 
+import waitress
+
+from .auth import AuthConfigError, require_token
 from .config import Config, ConfigError
 from .pipeline import CameraPipeline
+from .tailscale import TailscaleError, resolve_tailscale_ip
 from .web import create_app
 
 
@@ -58,6 +61,18 @@ def _fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def _resolve_host(configured_host: str) -> str:
+    """"tailscale" resolves this host's Tailscale IPv4 address and binds
+    only there; anything else is used as a literal host/IP. Never falls
+    back to 0.0.0.0 on failure -- fails loud instead."""
+    if configured_host != "tailscale":
+        return configured_host
+    try:
+        return resolve_tailscale_ip()
+    except TailscaleError as e:
+        raise ConfigError(str(e)) from e
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger = logging.getLogger(__name__)
@@ -69,9 +84,16 @@ def main() -> None:
         _fail(str(e))
         return  # unreachable; keeps type checkers happy about `config` below
 
+    try:
+        auth_token = require_token(config.secrets)
+    except AuthConfigError as e:
+        _fail(str(e))
+        return
+
     web_cfg = config.settings["web"]
     try:
-        _check_port_available(web_cfg["host"], web_cfg["port"])
+        host = _resolve_host(web_cfg["host"])
+        _check_port_available(host, web_cfg["port"])
     except ConfigError as e:
         _fail(str(e))
         return
@@ -84,28 +106,13 @@ def main() -> None:
         pipeline.stop()
         raise SystemExit(0)
 
-    def _restart(signum, frame):
-        # Re-exec explicitly via `-m camera_watcher.main` (rather than
-        # forwarding sys.argv as-is) so relative imports still work
-        # afterwards regardless of how this process was originally launched.
-        logger.info("Restarting to pick up updated code...")
-        pipeline.stop()
-        python = sys.executable
-        module_args = ["-m", "camera_watcher.main", "--config", args.config]
-        try:
-            os.execv(python, [python] + module_args)
-        except OSError:
-            logger.exception("Restart failed; exiting instead")
-            raise SystemExit(1)
-
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
-    if hasattr(signal, "SIGUSR1"):  # not available on Windows
-        signal.signal(signal.SIGUSR1, _restart)
 
-    app = create_app(config, pipeline)
+    app = create_app(config, pipeline, auth_token)
+    logger.info("Serving on %s:%s", host, web_cfg["port"])
     try:
-        app.run(host=web_cfg["host"], port=web_cfg["port"], threaded=True)
+        waitress.serve(app, host=host, port=web_cfg["port"], threads=8)
     finally:
         pipeline.stop()
 

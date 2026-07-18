@@ -144,13 +144,16 @@ digits, `_` and `-` only -- it ends up in clip filenames):
 cp config/camera.example.yaml config/front-door.yaml
 cp config/camera.secrets.example.yaml config/front-door.secrets.yaml
 # edit both: at minimum camera.name/host in front-door.yaml, and
-# camera.username/password in front-door.secrets.yaml
+# camera.username/password + web.auth_token in front-door.secrets.yaml
 ```
 
 `--config` is required and must point at a real file -- nothing is
 auto-created for you here. If you point it at a path that doesn't exist,
 the app fails immediately with the exact `cp` command above rather than
-silently starting some default camera you didn't mean to configure.
+silently starting some default camera you didn't mean to configure. Startup
+also fails loud if `web.auth_token` is missing/too short (see
+Authentication below) or if `web.host` is the default `"tailscale"` and
+this machine isn't on a Tailscale network.
 
 Run it:
 
@@ -180,10 +183,11 @@ try to use the same port, the second process fails loud at startup
 ("Cannot bind ... Address already in use") instead of silently stealing
 the port or failing somewhere more confusing later.
 
-Then open `http://localhost:8080` (or whatever `web.port` you set) for the
-web UI (Settings / Ignore Mask / Live Preview / Recordings tabs) -- from a
-browser **on that same machine**. To reach it from a different device, see
-Troubleshooting below.
+Then open `http://<tailscale-ip>:8080` (see "Network binding: Tailscale
+only" below for how to find that address, or whatever `web.port` you set)
+for the web UI (Settings / Ignore Mask / Live Preview / Recordings tabs) --
+from any device on the same tailnet. You'll land on a login page first; see
+Authentication below. If it doesn't load, see Troubleshooting below.
 
 To add a second camera, repeat the `cp` steps above with a new name and a
 different `web.port`, then run a second `python -m camera_watcher.main
@@ -206,36 +210,50 @@ crashed/exited processes (a systemd unit with `Restart=always`, `docker run
 --restart unless-stopped`, etc.), it'll just come back up -- stop it at that
 supervisor level too if you actually want it to stay down.
 
-## Updating from the web UI
+## Network binding: Tailscale only
 
-The header's "Update & Restart" button asks you to type `update` to confirm,
-then:
+`web.host` defaults to `"tailscale"`, which resolves this host's Tailscale
+IPv4 address (`tailscale ip -4`) at startup and binds the web server only
+there -- never `0.0.0.0`, never a LAN/public interface. If Tailscale isn't
+installed, isn't logged in, or returns something that doesn't look like a
+Tailscale address (`100.64.0.0/10`), startup fails loud with a plain-English
+message instead of silently binding somewhere broader. Set `web.host` to an
+explicit literal address (e.g. `127.0.0.1` for local testing) to bypass
+Tailscale entirely.
 
-1. Runs `git pull --ff-only` in the checkout this process is running from.
-   Fast-forward only -- it refuses (and reports an error, without touching
-   anything else) rather than creating a merge commit or discarding local
-   history if the branch has diverged.
-2. If nothing changed, it stops there and tells you you're already current
-   -- no restart.
-3. If it pulled something, it reinstalls `requirements.txt` with the same
-   Python environment the server is already running under. If that fails,
-   it stops there too and reports the error, deliberately **not**
-   restarting into a checkout whose dependencies didn't install cleanly.
-4. Only once both steps succeed does it restart: it cleanly stops the
-   pipeline (same as the Stop Server button) and then re-execs itself in
-   place (`os.execv`, same process ID, no supervisor required), which picks
-   up the newly pulled code on the way back up. The page polls until the
-   server responds again and reloads itself automatically.
+Served by [waitress](https://docs.pylonsproject.org/projects/waitress/), a
+production-grade WSGI server -- not Flask's own development server.
 
-Since `config/settings.yaml`/`secrets.yaml`/`mask.json` are all gitignored
-(see below), a `git pull` here can't collide with anything you've configured
-through the UI -- only tracked source files are affected.
+## Authentication
 
-**Worth knowing**: like every other button in this UI, `/api/update` has no
-authentication -- anyone who can reach the web UI can trigger it, and it
-runs whatever code is at the tip of your branch upstream. That's consistent
-with the rest of this tool (no login anywhere), but is worth keeping in mind
-if this is reachable beyond a trusted LAN.
+Every camera process requires its own auth token, generated once and stored
+in that camera's `<name>.secrets.yaml`:
+
+```bash
+python -c "from camera_watcher.auth import generate_token; print(generate_token())"
+```
+
+```yaml
+# <name>.secrets.yaml
+web:
+  auth_token: "<paste the generated token here>"
+```
+
+There's no way to disable this -- a missing or too-short (< 32 character)
+token fails startup loud, the same way a missing `camera.name` does.
+
+- **Browser**: visiting any page without a valid session redirects to
+  `/login`, a minimal token-entry form. `POST /api/login` compares the
+  submitted token against the configured one in constant time
+  (`hmac.compare_digest`) and, on success, sets a signed session cookie
+  (`HttpOnly`, `SameSite=Lax`) -- nothing else about the token is ever
+  stored client-side. "Log out" (header button, or `POST /api/logout`)
+  clears it.
+- **Scripts/automation**: send `Authorization: Bearer <token>` instead --
+  works on every `/api/*` route without ever touching cookies/sessions.
+- Any unauthenticated `/api/*` request gets a `401 {"ok": false, "error":
+  "unauthorized"}` JSON response; unauthenticated page loads redirect to
+  `/login`.
 
 ## Tuning ignore zones: drawing past the edge and the heatmap
 
@@ -337,7 +355,7 @@ later analysis stage at a directory for the first time.
 ### Missing dependencies
 
 Before doing anything else, `python -m camera_watcher.main` checks that
-OpenCV, NumPy, Flask, and PyYAML are all importable. If any are missing it
+OpenCV, NumPy, Flask, PyYAML, and waitress are all importable. If any are missing it
 prints exactly which packages are missing and how to install them (`pip
 install -r requirements.txt`), and exits, rather than failing with a raw
 traceback partway through startup. `camera_watcher/retention.py` has no
@@ -345,15 +363,16 @@ third-party dependencies at all and can run standalone with just Python 3.
 
 ## Credentials -- please read
 
-Camera credentials are **never** stored in `config/<name>.yaml` and always
-go in `config/<name>.secrets.yaml` instead (see `secrets_path` above if you
-want it named/located differently), kept as a separate file so the two
-can't accidentally get mixed up. Both are gitignored (see "Local config,
-not checked into git" below) -- neither is ever meant to be committed. Only
-the generic `config/camera.secrets.example.yaml` (with blank values) is
-tracked in git. The web UI's password field never echoes back the stored
-password -- it always displays blank, and leaving it blank on save keeps
-the existing value.
+Camera credentials **and** the web UI's auth token are **never** stored in
+`config/<name>.yaml` and always go in `config/<name>.secrets.yaml` instead
+(see `secrets_path` above if you want it named/located differently), kept
+as a separate file so the two can't accidentally get mixed up. Both are
+gitignored (see "Local config, not checked into git" below) -- neither is
+ever meant to be committed. Only the generic
+`config/camera.secrets.example.yaml` (with blank values) is tracked in git.
+The web UI's password field never echoes back the stored password -- it
+always displays blank, and leaving it blank on save keeps the existing
+value.
 
 Before committing, double check `git status` doesn't show any
 `config/<name>.yaml`, `config/<name>.secrets.yaml`, `config/<name>.mask.json`,
@@ -363,8 +382,8 @@ or anything under `data/`.
 
 Everything this app writes to disk on its own -- each camera's
 `config/<name>.yaml`, `config/<name>.secrets.yaml`, `config/<name>.mask.json`,
-its motion heatmap, event log, and recorded clips under `data/` -- is
-gitignored. Only checked-in *templates* live in git:
+its motion heatmap, and recorded clips (with their metadata sidecars) under
+`data/` -- is gitignored. Only checked-in *templates* live in git:
 
 | Tracked template (safe to commit) | Local file it produces (gitignored) |
 | --- | --- |
@@ -390,37 +409,31 @@ directly against the same clips directory later.
 
 ## Troubleshooting: can't reach the web UI from another device
 
-`web.host` defaults to `0.0.0.0`, so the app already listens on every
-network interface on the machine it runs on -- it's not restricted to
-`localhost`. If `http://<host-machine-ip>:8080` doesn't load from a second
-device, work through these in order:
+With the default `web.host: tailscale`, the app binds only its Tailscale
+IPv4 address -- reachable from any other device on the same tailnet, at
+`http://<tailscale-ip>:8080` (find the IP with `tailscale status` or
+`tailscale ip -4` on the host machine itself), nothing further to configure.
+If that doesn't load from a second device on the tailnet, work through
+these in order:
 
 1. **Confirm the app itself is healthy first, from the host machine:**
-   `curl http://localhost:8080/` there. If that fails, the problem is the
+   `curl http://$(tailscale ip -4):8080/ -I` there (expect a `302` to
+   `/login`, not a connection error). If that fails, the problem is the
    app/config, not networking -- check the terminal running
    `camera_watcher.main` for errors. If it succeeds, the app is fine and the
    rest of this list applies.
-2. **Use the host's actual LAN IP**, not `localhost`/`127.0.0.1` (that only
-   ever means "this machine" to whatever device you type it into). Find it
-   with `ip addr` / `hostname -I` (Linux), `ipconfig` (Windows), or `ifconfig`
-   (macOS) -- look for the address on your LAN/Wi-Fi adapter, not a VPN,
-   Docker, or loopback interface.
-3. **Check `config/settings.yaml`'s `web.host` hasn't been changed** to
-   `127.0.0.1` or `localhost` -- that would make it refuse connections from
-   anywhere but the host itself. It should be `0.0.0.0`.
-4. **Running inside Docker, WSL2, or a VM?** `0.0.0.0` inside the
-   container/VM is not automatically reachable from your LAN. Docker needs
-   an explicit published port (`docker run -p 8080:8080 ...`); WSL2 needs
-   either mirrored networking mode or its own port-forwarding setup.
-5. **Check the host machine's firewall** allows inbound connections on the
-   port (e.g. `sudo ufw allow 8080/tcp` on Ubuntu, or an inbound rule in
-   Windows Defender Firewall / macOS's firewall). This is the most common
-   blocker and won't show up in the app's own logs at all -- the connection
-   just times out.
-6. **Same network, but still nothing?** Some Wi-Fi networks (especially
-   guest networks) enable "client/AP isolation," which blocks device-to-device
-   traffic even on the same SSID/subnet. Try both devices on a wired
-   connection or a non-guest network to rule this out.
+2. **Confirm both devices are actually on the same tailnet** and that
+   Tailscale is connected on both (`tailscale status` on each).
+3. **Check Tailscale ACLs** if your tailnet has custom access rules --
+   they can block device-to-device traffic even within the same tailnet.
+4. **Check the host machine's local firewall** allows inbound connections
+   on the port from the `tailscale0` interface (e.g. `sudo ufw allow in on
+   tailscale0 to any port 8080` on Ubuntu). This is the most common blocker
+   and won't show up in the app's own logs at all -- the connection just
+   times out.
+5. **Set `web.host` explicitly** if you deliberately want something other
+   than Tailscale (e.g. `127.0.0.1` for local-machine-only testing) --
+   see "Network binding: Tailscale only" above.
 
 ## Tests
 

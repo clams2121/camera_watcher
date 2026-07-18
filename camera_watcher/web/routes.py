@@ -18,16 +18,31 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-from flask import Blueprint, Response, abort, current_app, jsonify, render_template, request, send_file
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    current_app,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 
+from ..auth import tokens_match
 from ..constants import TEMP_SUFFIX
-from ..update import install_dependencies, pull_latest, repo_root
 
 bp = Blueprint("camera_watcher", __name__)
 logger = logging.getLogger(__name__)
 
 _SHUTDOWN_CONFIRM_TEXT = "quit"
-_UPDATE_CONFIRM_TEXT = "update"
+
+# Reachable without a valid session/bearer token -- everything else on this
+# blueprint requires one, enforced in _require_auth below.
+_PUBLIC_ENDPOINTS = {"camera_watcher.login_page", "camera_watcher.login"}
 
 # Recording filenames are always "<camera_name>_<YYYYMMDD>_<HHMMSS>.mp4"
 # (see recorder.py) -- reject anything else outright before it ever touches
@@ -79,6 +94,46 @@ def _config():
 
 def _pipeline():
     return current_app.config["CAMERA_PIPELINE"]
+
+
+@bp.before_request
+def _require_auth():
+    if request.endpoint in _PUBLIC_ENDPOINTS:
+        return None
+
+    if session.get("authenticated"):
+        return None
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        candidate = auth_header[len("Bearer ") :]
+        if tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
+            return None
+
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return redirect(url_for("camera_watcher.login_page"))
+
+
+@bp.get("/login")
+def login_page():
+    return render_template("login.html")
+
+
+@bp.post("/api/login")
+def login():
+    body = request.get_json(force=True, silent=True) or {}
+    candidate = str(body.get("token", ""))
+    if not tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
+        return jsonify({"ok": False, "error": "invalid token"}), 401
+    session["authenticated"] = True
+    return jsonify({"ok": True})
+
+
+@bp.post("/api/logout")
+def logout():
+    session.pop("authenticated", None)
+    return jsonify({"ok": True})
 
 
 @bp.get("/")
@@ -303,47 +358,3 @@ def shutdown():
     logger.warning("Shutdown requested via the web UI -- stopping the server.")
     _schedule_shutdown()
     return jsonify({"ok": True, "message": "Server is stopping."})
-
-
-def _schedule_restart(delay: float = 0.5) -> None:
-    """Send this process SIGUSR1 shortly after returning, for the same
-    flush-the-response-first reason as _schedule_shutdown. main.py handles
-    SIGUSR1 by cleanly stopping the pipeline and then re-exec'ing itself,
-    picking up whatever code is now on disk."""
-    threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGUSR1)).start()
-
-
-@bp.post("/api/update")
-def update():
-    body = request.get_json(force=True, silent=True) or {}
-    confirm = str(body.get("confirm", "")).strip().lower()
-    if confirm != _UPDATE_CONFIRM_TEXT:
-        return jsonify({"ok": False, "error": f'confirmation text must be "{_UPDATE_CONFIRM_TEXT}"'}), 400
-
-    root = repo_root()
-    pull_result, updated = pull_latest(root)
-    if not pull_result.ok:
-        logger.warning("Update: git pull failed: %s", pull_result.message)
-        return jsonify({"ok": False, "updated": False, "error": pull_result.message}), 500
-
-    if not updated:
-        return jsonify({"ok": True, "updated": False, "message": pull_result.message})
-
-    deps_result = install_dependencies(root)
-    if not deps_result.ok:
-        logger.warning("Update: dependency install failed: %s", deps_result.message)
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "updated": True,
-                    "error": "Pulled new code, but installing dependencies failed -- not restarting: "
-                    + deps_result.message,
-                }
-            ),
-            500,
-        )
-
-    logger.warning("Update requested via the web UI -- pulled latest code, restarting.")
-    _schedule_restart()
-    return jsonify({"ok": True, "updated": True, "message": "Updated. Restarting..."})
