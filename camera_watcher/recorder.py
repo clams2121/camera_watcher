@@ -39,18 +39,20 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from .assemble import AssemblyError, assemble_clip
+from .assemble import AssemblyError, assemble_clip, probe_video_info
 from .constants import TEMP_SUFFIX
 from .segment_cache import SegmentCache
 
 logger = logging.getLogger(__name__)
 
 BoundingBox = Tuple[int, int, int, int]  # (x, y, w, h)
+
+METADATA_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -61,7 +63,13 @@ class RecorderConfig:
     max_chunk_seconds: float = 180
     overlap_seconds: float = 5
     camera_name: str = "camera1"
-    event_log_path: Optional[Path] = None  # JSONL log of each clip's motion bounding box; None disables it
+    # Called once, fresh, whenever a new event window opens -- captures "what
+    # config/mask was actually active for this event," not whatever's active
+    # by the time assembly gets around to running (which can be later, and on
+    # a different thread). A no-op default keeps these optional for callers
+    # (like most tests) that don't care about fleet-wide config auditing.
+    config_hash_provider: Callable[[], str] = field(default=lambda: "")
+    mask_hash_provider: Callable[[], str] = field(default=lambda: "")
 
 
 def _timestamp_name(camera_name: str, ts: float, suffix: str) -> str:
@@ -71,22 +79,29 @@ def _timestamp_name(camera_name: str, ts: float, suffix: str) -> str:
 
 @dataclass
 class _Window:
-    """Per-chunk state: the time window to assemble, plus the same motion
-    stats the old recorder accumulated per-frame, still fed by the
-    frame-processing thread's motion detector output."""
+    """Per-chunk state: the time window to assemble, plus the motion stats
+    fed in per-frame by the frame-processing thread's motion detector
+    output, accumulated here for the companion metadata JSON."""
 
     content_start_ts: float
     chunk_start_ts: float
+    config_hash: str = ""
+    mask_hash: str = ""
     bbox: Optional[Tuple[int, int, int, int]] = None
     frame_count: int = 0
     motion_frame_count: int = 0
     score_sum: float = 0.0
     score_count: int = 0
     score_max: float = 0.0
+    score_max_ts: Optional[float] = None
     max_detection_fraction: float = 0.0
     motion_seconds: float = 0.0
     prev_live_ts: Optional[float] = None
     last_frame_ts: Optional[float] = None
+    # One entry per whole second offset from content_start_ts -- a coarse
+    # summary timeline, not a per-frame trace (which could be thousands of
+    # entries for a long, high-fps event).
+    timeline: Dict[int, Dict[str, object]] = field(default_factory=dict)
 
 
 class SegmentRecorder:
@@ -157,7 +172,13 @@ class SegmentRecorder:
 
     def _open_window(self, boundary_ts: float) -> None:
         content_start = boundary_ts - self.config.pre_buffer_seconds
-        self._window = _Window(content_start_ts=content_start, chunk_start_ts=boundary_ts, last_frame_ts=boundary_ts)
+        self._window = _Window(
+            content_start_ts=content_start,
+            chunk_start_ts=boundary_ts,
+            last_frame_ts=boundary_ts,
+            config_hash=self.config.config_hash_provider(),
+            mask_hash=self.config.mask_hash_provider(),
+        )
         self._recording = True
         self._register_active_start(content_start)
         logger.info("Motion event started (window opens %.1fs before trigger)", self.config.pre_buffer_seconds)
@@ -190,9 +211,17 @@ class SegmentRecorder:
             w.motion_frame_count += 1
             w.score_sum += score
             w.score_count += 1
-            w.score_max = max(w.score_max, score)
+            if score > w.score_max:
+                w.score_max = score
+                w.score_max_ts = timestamp
 
         w.max_detection_fraction = max(w.max_detection_fraction, detection_fraction)
+
+        bucket_t = int(timestamp - w.content_start_ts)
+        bucket = w.timeline.setdefault(bucket_t, {"score_max": 0.0, "motion_detected": False})
+        if motion_detected:
+            bucket["score_max"] = max(bucket["score_max"], score)
+            bucket["motion_detected"] = True
 
     def _roll_chunk(self, timestamp: float) -> None:
         old_window = self._window
@@ -202,7 +231,13 @@ class SegmentRecorder:
         # the two.
         self._register_active_start(new_content_start)
         self._enqueue_assembly(old_window, timestamp)
-        self._window = _Window(content_start_ts=new_content_start, chunk_start_ts=timestamp, last_frame_ts=timestamp)
+        self._window = _Window(
+            content_start_ts=new_content_start,
+            chunk_start_ts=timestamp,
+            last_frame_ts=timestamp,
+            config_hash=self.config.config_hash_provider(),
+            mask_hash=self.config.mask_hash_provider(),
+        )
 
     def _finish_event(self, end_ts: float) -> None:
         window = self._window
@@ -280,40 +315,57 @@ class SegmentRecorder:
 
         temp_path.rename(final_path)
         logger.info("Finalized recording: %s (%d segment(s))", final_path.name, len(segments))
-        self._log_event(final_path.name, window)
         self._write_metadata(final_path, window, end_ts)
 
-    def _log_event(self, clip_name: str, window: _Window) -> None:
-        if self.config.event_log_path is None or window.bbox is None:
-            return
-        x1, y1, x2, y2 = window.bbox
-        entry = {
-            "timestamp": time.time(),
-            "camera": self.config.camera_name,
-            "clip": clip_name,
-            "bbox": [x1, y1, x2 - x1, y2 - y1],
-        }
-        try:
-            self.config.event_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.config.event_log_path.open("a") as f:
-                f.write(json.dumps(entry) + "\n")
-        except OSError:
-            logger.exception("Failed to append motion event log entry")
-
     def _write_metadata(self, video_path: Path, window: _Window, end_ts: float) -> None:
-        """Writes <video_path stem>.json alongside the clip: a companion
-        record with everything needed to review this event later without
-        opening the video itself."""
+        """Writes <video_path stem>.json alongside the clip: the single,
+        complete record of this event -- there's no separate motion-events
+        log any more (schema v2 folds everything, including the bounding
+        box, in here)."""
         start_ts = window.content_start_ts
         mean_score = window.score_sum / window.score_count if window.score_count else 0.0
         motion_frame_ratio = window.motion_frame_count / window.frame_count if window.frame_count else 0.0
 
+        # Real, ffprobe'd values for the assembled file -- segment boundaries
+        # are keyframe-aligned, so the actual content span can differ
+        # slightly from [start_ts, end_ts). Best-effort: a probe failure
+        # shouldn't cost the clip itself, only these two fields.
+        resolution = None
+        duration_seconds = None
+        try:
+            info = probe_video_info(video_path)
+            resolution = [info.width, info.height]
+            duration_seconds = round(info.duration_seconds, 3)
+        except Exception:
+            logger.exception("Failed to probe %s for resolution/duration", video_path.name)
+
+        live_span = (window.last_frame_ts - window.chunk_start_ts) if window.last_frame_ts is not None else 0.0
+        sub_fps_measured = round((window.frame_count - 1) / live_span, 2) if live_span > 0 else None
+
+        peak_motion_time = (
+            datetime.fromtimestamp(window.score_max_ts).astimezone().isoformat()
+            if window.score_max_ts is not None
+            else None
+        )
+        motion_timeline = [
+            {"t": t, "score": round(bucket["score_max"], 4), "motion_detected": bucket["motion_detected"]}
+            for t, bucket in sorted(window.timeline.items())
+        ]
+        bounding_box = None
+        if window.bbox is not None:
+            x1, y1, x2, y2 = window.bbox
+            bounding_box = [x1, y1, x2 - x1, y2 - y1]
+
         metadata = {
+            "schema_version": METADATA_SCHEMA_VERSION,
             "event_id": video_path.stem,
             "camera_id": self.config.camera_name,
             "start_time": datetime.fromtimestamp(start_ts).astimezone().isoformat(),
             "end_time": datetime.fromtimestamp(end_ts).astimezone().isoformat(),
+            "duration_seconds": duration_seconds,
             "video_path": str(video_path.resolve()),
+            "resolution": resolution,
+            "bounding_box": bounding_box,
             "motion_confidence": {
                 "mean_score": round(mean_score, 4),
                 "max_score": round(window.score_max, 4),
@@ -321,6 +373,11 @@ class SegmentRecorder:
             },
             "motion_time": round(window.motion_seconds, 4),
             "detection_size": round(window.max_detection_fraction, 4),
+            "peak_motion_time": peak_motion_time,
+            "motion_timeline": motion_timeline,
+            "sub_fps_measured": sub_fps_measured,
+            "config_hash": window.config_hash,
+            "mask_hash": window.mask_hash,
         }
 
         metadata_path = video_path.with_suffix(".json")

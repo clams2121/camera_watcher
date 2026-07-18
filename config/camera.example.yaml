@@ -8,10 +8,10 @@
 #     python -m camera_watcher.main --config config/<name>.yaml
 #
 # Every relative path in this file (data_root, secrets_path, mask.path,
-# recording.output_dir, recording.cache_dir, motion.heatmap_path,
-# recording.event_log_path) resolves against the directory this file lives
-# in -- never against whatever directory you happen to run the command
-# from. Absolute paths are also fine and pass through unchanged.
+# recording.output_dir, recording.cache_dir, motion.heatmap_path) resolves
+# against the directory this file lives in -- never against whatever
+# directory you happen to run the command from. Absolute paths are also
+# fine and pass through unchanged.
 #
 # Edit by hand, or via the web UI's Settings tab, which rewrites this file
 # (and only this file -- it never touches secrets or the mask).
@@ -57,7 +57,6 @@ recording:
   post_buffer_seconds: 10 # seconds to keep recording after motion stops
   max_chunk_seconds: 180 # hard cap per file (3 minutes)
   overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
-  event_log_path: data/motion_events.jsonl # one JSON line per finalized clip (timestamp, clip name, motion bounding box); set to "" to disable
 
 retention:
   enabled: true

@@ -5,14 +5,62 @@ whatever the camera sent.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 
 class AssemblyError(Exception):
     """Raised when ffmpeg fails to concatenate the given segments."""
+
+
+class ProbeError(Exception):
+    """Raised when ffprobe fails to read a video file, or the file has no video stream."""
+
+
+@dataclass
+class VideoInfo:
+    width: int
+    height: int
+    duration_seconds: float
+
+
+def probe_video_info(path: Path) -> VideoInfo:
+    """Reads real resolution/duration back from an assembled clip -- since
+    assembly is pure stream-copy, this is exactly what the camera sent, and
+    it's the source of truth for the companion metadata JSON rather than
+    anything computed from the recorder's own event-window timestamps."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ProbeError(f"ffprobe failed on {path.name}: {result.stderr.strip()[-2000:]}")
+    try:
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        return VideoInfo(
+            width=int(stream["width"]),
+            height=int(stream["height"]),
+            duration_seconds=float(data["format"]["duration"]),
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        raise ProbeError(f"ffprobe returned an unexpected result for {path.name}: {e}") from e
 
 
 def assemble_clip(segments: List[Path], output_path: Path) -> None:

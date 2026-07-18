@@ -147,12 +147,6 @@ def test_settings_property_stays_raw_while_resolved_computes_absolute_paths(tmp_
     assert os.path.isabs(config.resolved()["recording"]["output_dir"])
 
 
-def test_event_log_path_blank_means_disabled_not_a_derived_default(tmp_path):
-    path = _write_config(tmp_path / "front-door.yaml", recording={"event_log_path": ""})
-    config = Config(path)
-    assert config.resolved()["recording"]["event_log_path"] == ""
-
-
 def test_cache_dir_blank_derives_from_data_root_and_camera_name(tmp_path):
     path = _write_config(tmp_path / "front-door.yaml")
     config = Config(path)

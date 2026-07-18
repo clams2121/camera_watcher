@@ -92,10 +92,6 @@ DEFAULTS: dict[str, Any] = {
         "post_buffer_seconds": 10,
         "max_chunk_seconds": 180,
         "overlap_seconds": 5,
-        # One JSON line per finalized clip with its motion bounding box.
-        # Blank ("") disables it -- unlike the fields above, blank here does
-        # NOT mean "derive a default", it means "don't write this file".
-        "event_log_path": "data/motion_events.jsonl",
     },
     "retention": {
         "enabled": True,
@@ -222,9 +218,6 @@ class Config:
         settings["data_root"] = str(data_root)
 
         settings["motion"]["heatmap_path"] = str(self._resolve(settings["motion"]["heatmap_path"]))
-
-        event_log_path = settings["recording"].get("event_log_path") or ""
-        settings["recording"]["event_log_path"] = str(self._resolve(event_log_path)) if event_log_path else ""
 
         mask_path = settings["mask"]["path"] or f"{camera_name}.mask.json"
         settings["mask"]["path"] = str(self._resolve(mask_path))

@@ -159,12 +159,12 @@ python -m camera_watcher.main --config config/front-door.yaml
 ```
 
 **Every relative path inside `front-door.yaml`** (`data_root`,
-`secrets_path`, `mask.path`, `recording.output_dir`,
-`motion.heatmap_path`, `recording.event_log_path`) resolves against the
-directory `front-door.yaml` itself lives in -- **never** against whatever
-directory you happen to run the command from. This is what makes it safe
-to run several camera processes from systemd, cron, or any working
-directory. Absolute paths work too and pass through unchanged.
+`secrets_path`, `mask.path`, `recording.output_dir`, `recording.cache_dir`,
+`motion.heatmap_path`) resolves against the directory `front-door.yaml`
+itself lives in -- **never** against whatever directory you happen to run
+the command from. This is what makes it safe to run several camera
+processes from systemd, cron, or any working directory. Absolute paths
+work too and pass through unchanged.
 
 By default, `secrets_path` derives to `front-door.secrets.yaml` and
 `mask.path` to `front-door.mask.json`, both next to the config file;
@@ -237,9 +237,9 @@ runs whatever code is at the tip of your branch upstream. That's consistent
 with the rest of this tool (no login anywhere), but is worth keeping in mind
 if this is reachable beyond a trusted LAN.
 
-## Tuning ignore zones: drawing past the edge, the heatmap, and event log
+## Tuning ignore zones: drawing past the edge and the heatmap
 
-Three features work together for diagnosing "this ignore zone isn't working"
+Two features work together for diagnosing "this ignore zone isn't working"
 (e.g. something at the edge of frame -- a flag, a tree branch -- keeps
 triggering clips despite being outlined):
 
@@ -257,12 +257,10 @@ triggering clips despite being outlined):
   It **never decays or resets on its own** -- it's a running total from a
   persisted file (`motion.heatmap_path`, default `data/motion_heatmap.npy`)
   until you click "Reset heatmap."
-- **Per-clip motion log.** Every finalized clip appends one line to
-  `recording.event_log_path` (default `data/motion_events.jsonl`) with its
-  timestamp, filename, and the overall bounding box of what triggered it --
-  e.g. `{"timestamp": ..., "camera": "camera1", "clip": "camera1_....mp4",
-  "bbox": [x, y, w, h]}`. Set it to `""` to disable. Useful for scripting a
-  review of which regions keep triggering recordings over time.
+
+For scripting a review of which regions keep triggering recordings over
+time, use each clip's companion metadata JSON (`bounding_box`) rather than a
+separate log -- see "Companion metadata for each clip" below.
 
 ## Bounding boxes: live preview only
 
@@ -277,30 +275,64 @@ frame content in the recording path to draw on in the first place.
 ## Companion metadata for each clip
 
 Every finalized clip gets a same-named `.json` file alongside it (e.g.
-`camera1_20260117_140030.mp4` -> `camera1_20260117_140030.json`) -- written
-right after the video finishes, deleted along with it (retention, single
-delete, and group delete all remove both together):
+`camera1_20260117_140030.mp4` -> `camera1_20260117_140030.json`) -- the
+**single source of truth** for everything known about that event (there's no
+separate motion-events log any more). Written right after the video
+finishes, deleted along with it (retention, single delete, and group delete
+all remove both together):
 
 ```json
 {
+  "schema_version": 2,
   "event_id": "camera1_20260117_140030",
   "camera_id": "camera1",
   "start_time": "2026-01-17T14:00:28.512340-05:00",
   "end_time": "2026-01-17T14:00:42.881230-05:00",
+  "duration_seconds": 14.437,
   "video_path": "/abs/path/to/data/clips/camera1_20260117_140030.mp4",
+  "resolution": [2560, 1440],
+  "bounding_box": [812, 340, 220, 180],
   "motion_confidence": {"mean_score": 812.4, "max_score": 2350.0, "motion_frame_ratio": 0.6667},
   "motion_time": 8.0,
-  "detection_size": 0.1
+  "detection_size": 0.1,
+  "peak_motion_time": "2026-01-17T14:00:33.100120-05:00",
+  "motion_timeline": [
+    {"t": 0, "score": 0.0, "motion_detected": false},
+    {"t": 1, "score": 1120.5, "motion_detected": true},
+    {"t": 2, "score": 2350.0, "motion_detected": true}
+  ],
+  "sub_fps_measured": 9.8,
+  "config_hash": "3f1a9c02e8b1",
+  "mask_hash": "a90eddf6c123"
 }
 ```
 
+- **schema_version**: bumped whenever this shape changes; `rebuild_index.py` (below) and any future tooling should check it rather than assume.
 - **event_id**: the clip's filename stem (camera name + timestamp combined) -- a stable, unique key for this event.
 - **camera_id**: the configured camera name.
-- **start_time** / **end_time**: ISO 8601 with UTC offset, covering the *actual* written content -- including the pre-buffer prepended at the start and any post-buffer cooldown at the end, not just the moment motion was first confirmed.
+- **start_time** / **end_time**: ISO 8601 with UTC offset -- the recorder's logical event window (pre-buffer through post-buffer cooldown), not necessarily byte-identical to the assembled file's real span (see `duration_seconds`).
+- **duration_seconds**: the *actual* assembled clip's duration, read back from the file itself via `ffprobe` -- segment boundaries are keyframe-aligned, so this can run a little longer than `end_time - start_time`.
 - **video_path**: absolute path to the clip.
+- **resolution**: `[width, height]`, read back from the assembled file -- always exactly what the camera's main stream sent, since recording is pure passthrough.
+- **bounding_box**: `[x, y, w, h]`, the union of every motion detection's box during the event, or `null` if none were reported.
 - **motion_confidence**: this detector uses background subtraction + contour area, not a neural net, so there's no built-in 0-1 probability -- instead: `mean_score`/`max_score` are the average/peak raw per-frame motion score (contour area) across frames where motion was actually detected, and `motion_frame_ratio` is the fraction of all frames in the clip that had motion detected at all, as a proxy for how consistent the detection was through the clip.
 - **motion_time**: total seconds (not a fraction) where motion was detected, summed across the live portion of the clip -- 4 decimal places.
 - **detection_size**: the largest single detected contour's bounding-box area as a fraction of the frame (e.g. `0.1` = the biggest detection covered 10% of the image at its peak) -- 4 decimal places.
+- **peak_motion_time**: ISO 8601 timestamp of the single highest-scoring frame, or `null` if there was none.
+- **motion_timeline**: one entry per whole second of the event (not per-frame -- that could be thousands of entries for a long event), each with that second's peak score and whether any motion was detected in it.
+- **sub_fps_measured**: the sub-stream's actual observed frame rate during this event -- a diagnostic, not a recording parameter (recording never uses an fps hint at all; it's pure stream-copy).
+- **config_hash** / **mask_hash**: short hashes of the camera's settings/ignore-mask exactly as they were when this event's window opened -- lets you correlate "which config produced this clip" across a fleet, or spot that a clip landed right after a config change, without ever hashing credentials (`config_hash` is computed from `config/<name>.yaml` only, never `.secrets.yaml`).
+
+### Rebuilding the clip index
+
+`python -m camera_watcher.rebuild_index <clips_dir>` scans every `<clip>.json`
+sidecar under a clips directory, cross-checks it against the matching `.mp4`
+(logging a warning and skipping anything orphaned either direction -- a clip
+with no metadata, or metadata with no clip), and writes a flat,
+`start_time`-sorted `index.jsonl` (one metadata record per line) at
+`<clips_dir>/index.jsonl` by default (`--index-path` to override). Useful
+after copying/reorganizing clips onto a new machine, or before pointing any
+later analysis stage at a directory for the first time.
 
 ### Missing dependencies
 

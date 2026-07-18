@@ -2,6 +2,8 @@ import json
 import time
 from datetime import datetime
 
+import pytest
+
 from camera_watcher.recorder import RecorderConfig, SegmentRecorder, TEMP_SUFFIX
 from camera_watcher.segment_cache import SegmentCache, SegmentCacheConfig
 from tests.ffmpeg_helpers import make_cache_segments, segment_name
@@ -26,15 +28,19 @@ def _make_cache(tmp_path, segment_seconds=1.0):
 
 
 def _make_recorder(tmp_path, cache, **overrides):
-    config = RecorderConfig(
+    kwargs = dict(
         output_dir=tmp_path / "clips",
         pre_buffer_seconds=overrides.get("pre_buffer_seconds", 2),
         post_buffer_seconds=overrides.get("post_buffer_seconds", 1),
         max_chunk_seconds=overrides.get("max_chunk_seconds", 100),
         overlap_seconds=overrides.get("overlap_seconds", 1),
         camera_name=overrides.get("camera_name", "cam"),
-        event_log_path=overrides.get("event_log_path"),
     )
+    if "config_hash_provider" in overrides:
+        kwargs["config_hash_provider"] = overrides["config_hash_provider"]
+    if "mask_hash_provider" in overrides:
+        kwargs["mask_hash_provider"] = overrides["mask_hash_provider"]
+    config = RecorderConfig(**kwargs)
     recorder = SegmentRecorder(cache, config)
     recorder.start()
     return recorder
@@ -47,6 +53,14 @@ def _finalized_clips(clips_dir):
 def _wait_for_clips(clips_dir, count):
     assert _wait_until(lambda: len(_finalized_clips(clips_dir)) == count, timeout=8.0)
     return _finalized_clips(clips_dir)
+
+
+def _read_metadata(clip_path):
+    """Metadata is written just after the clip is renamed into place, not
+    atomically alongside it -- wait for it rather than racing the assembler."""
+    metadata_path = clip_path.with_suffix(".json")
+    assert _wait_until(metadata_path.exists, timeout=8.0)
+    return json.loads(metadata_path.read_text())
 
 
 def _wait_for_stable_finalized_clip_count(clips_dir, timeout=8.0, stable_for=0.5):
@@ -120,12 +134,11 @@ def test_forced_chunk_roll_creates_multiple_clips_with_no_leftover_temp_files(tm
         recorder.stop()
 
 
-def test_event_log_records_union_bbox_on_finalize(tmp_path):
+def test_metadata_records_union_bbox_and_no_legacy_event_log(tmp_path):
+    """Schema v2 folds the bounding box into the companion metadata JSON --
+    there's no separate motion-events log any more."""
     cache = _make_cache(tmp_path, segment_seconds=1.0)
-    log_path = tmp_path / "events.jsonl"
-    recorder = _make_recorder(
-        tmp_path, cache, pre_buffer_seconds=1, post_buffer_seconds=1, overlap_seconds=0.5, event_log_path=log_path
-    )
+    recorder = _make_recorder(tmp_path, cache, pre_buffer_seconds=1, post_buffer_seconds=1, overlap_seconds=0.5)
     try:
         t0 = BASE_TS + 20_000
         make_cache_segments(cache.config.cache_dir, start_ts=t0 - 2, count=8, segment_seconds=1.0)
@@ -138,31 +151,32 @@ def test_event_log_records_union_bbox_on_finalize(tmp_path):
         recorder.handle_frame(final_ts, False)
 
         assert _wait_until(lambda: not recorder.is_recording)
-        assert _wait_until(log_path.exists)
-        lines = log_path.read_text().strip().splitlines()
-        assert len(lines) == 1
-        entry = json.loads(lines[0])
-        assert entry["camera"] == "cam"
-        assert entry["clip"].startswith("cam_")
-        assert entry["bbox"] == [5, 20, 35, 40]
+        clips = _wait_for_clips(tmp_path / "clips", count=1)
+        metadata_path = clips[0].with_suffix(".json")
+        assert _wait_until(metadata_path.exists)
+        metadata = json.loads(metadata_path.read_text())
+        assert metadata["bounding_box"] == [5, 20, 35, 40]
+
+        assert list(tmp_path.glob("**/*.jsonl")) == []  # no legacy motion_events.jsonl file anywhere
     finally:
         recorder.stop()
 
 
-def test_event_log_disabled_by_default(tmp_path):
+def test_metadata_bounding_box_is_null_when_no_boxes_were_ever_reported(tmp_path):
     cache = _make_cache(tmp_path, segment_seconds=1.0)
     recorder = _make_recorder(tmp_path, cache, pre_buffer_seconds=1, post_buffer_seconds=1)
     try:
         t0 = BASE_TS + 30_000
         make_cache_segments(cache.config.cache_dir, start_ts=t0 - 2, count=6, segment_seconds=1.0)
 
-        recorder.handle_frame(t0, True, boxes=[(0, 0, 5, 5)])
+        recorder.handle_frame(t0, True)  # motion detected but no boxes supplied
         final_ts = t0 + recorder.config.post_buffer_seconds + 0.5
         recorder.handle_frame(final_ts, False)
 
         assert _wait_until(lambda: not recorder.is_recording)
-        _wait_for_clips(tmp_path / "clips", count=1)  # a clip *was* produced...
-        assert list(tmp_path.glob("**/*.jsonl")) == []  # ...but no log file, since event_log_path is unset
+        clips = _wait_for_clips(tmp_path / "clips", count=1)
+        metadata = _read_metadata(clips[0])
+        assert metadata["bounding_box"] is None
     finally:
         recorder.stop()
 
@@ -191,6 +205,7 @@ def test_writes_companion_metadata_json_on_finalize(tmp_path):
         assert _wait_until(metadata_path.exists)
         metadata = json.loads(metadata_path.read_text())
 
+        assert metadata["schema_version"] == 2
         assert metadata["event_id"] == clips[0].stem
         assert metadata["camera_id"] == "cam1"
         assert metadata["video_path"] == str(clips[0].resolve())
@@ -203,6 +218,52 @@ def test_writes_companion_metadata_json_on_finalize(tmp_path):
         start_dt = datetime.fromisoformat(metadata["start_time"])
         end_dt = datetime.fromisoformat(metadata["end_time"])
         assert end_dt > start_dt
+
+        # real, ffprobe'd values from the assembled (real, tiny) clip -- not
+        # computed from the recorder's own timestamps
+        assert metadata["resolution"] == [64, 64]
+        assert metadata["duration_seconds"] > 0
+
+        # 3 frames (t0, t1, t2) spanning 2 real seconds (t0 -> t2) -> ~1fps
+        assert metadata["sub_fps_measured"] == pytest.approx(1.0, abs=0.01)
+
+        # the peak score (300) was reported at t1
+        assert metadata["peak_motion_time"] == datetime.fromtimestamp(t1).astimezone().isoformat()
+
+        timeline = metadata["motion_timeline"]
+        assert [entry["t"] for entry in timeline] == sorted(entry["t"] for entry in timeline)
+        assert any(entry["score"] == 300.0 and entry["motion_detected"] for entry in timeline)
+
+        # no fleet-config hashing wired up in this test -- providers default to ""
+        assert metadata["config_hash"] == ""
+        assert metadata["mask_hash"] == ""
+    finally:
+        recorder.stop()
+
+
+def test_metadata_config_and_mask_hash_reflect_what_was_active_at_event_open(tmp_path):
+    cache = _make_cache(tmp_path, segment_seconds=1.0)
+    recorder = _make_recorder(
+        tmp_path,
+        cache,
+        pre_buffer_seconds=1,
+        post_buffer_seconds=1,
+        config_hash_provider=lambda: "cfg-abc123",
+        mask_hash_provider=lambda: "mask-def456",
+    )
+    try:
+        t0 = BASE_TS + 45_000
+        make_cache_segments(cache.config.cache_dir, start_ts=t0 - 2, count=6, segment_seconds=1.0)
+
+        recorder.handle_frame(t0, True)
+        final_ts = t0 + recorder.config.post_buffer_seconds + 0.5
+        recorder.handle_frame(final_ts, False)
+
+        assert _wait_until(lambda: not recorder.is_recording)
+        clips = _wait_for_clips(tmp_path / "clips", count=1)
+        metadata = _read_metadata(clips[0])
+        assert metadata["config_hash"] == "cfg-abc123"
+        assert metadata["mask_hash"] == "mask-def456"
     finally:
         recorder.stop()
 
@@ -220,7 +281,7 @@ def test_metadata_start_time_is_pre_buffer_seconds_before_the_triggering_frame(t
 
         assert _wait_until(lambda: not recorder.is_recording)
         clips = _wait_for_clips(tmp_path / "clips", count=1)
-        metadata = json.loads(clips[0].with_suffix(".json").read_text())
+        metadata = _read_metadata(clips[0])
         start_dt = datetime.fromisoformat(metadata["start_time"])
         expected = datetime.fromtimestamp(t0 - 3).astimezone()
         assert abs((start_dt - expected).total_seconds()) < 0.001

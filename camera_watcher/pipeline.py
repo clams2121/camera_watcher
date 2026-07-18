@@ -17,6 +17,8 @@ another --
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import queue
 import threading
@@ -110,7 +112,6 @@ class CameraPipeline:
 
     def _recorder_config(self, settings: dict) -> RecorderConfig:
         rec = settings["recording"]
-        event_log_path = rec.get("event_log_path") or None
         return RecorderConfig(
             output_dir=Path(rec["output_dir"]),
             pre_buffer_seconds=rec["pre_buffer_seconds"],
@@ -118,8 +119,21 @@ class CameraPipeline:
             max_chunk_seconds=rec["max_chunk_seconds"],
             overlap_seconds=rec["overlap_seconds"],
             camera_name=settings["camera"]["name"],
-            event_log_path=Path(event_log_path) if event_log_path else None,
+            config_hash_provider=self._config_hash,
+            mask_hash_provider=self._mask_hash,
         )
+
+    def _config_hash(self) -> str:
+        # Hashes the raw, persisted settings (not resolved() -- absolute
+        # paths would make an otherwise-identical config hash differently
+        # per machine) so a metadata sidecar can be correlated with "which
+        # config was active" across a fleet, without ever hashing secrets.
+        payload = json.dumps(self.config.settings, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
+
+    def _mask_hash(self) -> str:
+        payload = json.dumps(self.mask_store.polygons, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
 
     def _segment_cache_config(self, settings: dict) -> SegmentCacheConfig:
         rec = settings["recording"]
