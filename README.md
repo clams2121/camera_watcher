@@ -26,6 +26,9 @@ of the larger project.
   fully written.
 - A background sweep enforces the configured retention policy (max age
   and/or max total storage), only ever touching finalized clips.
+- A never-decaying motion heatmap and a per-clip event log (bounding boxes)
+  help spot spots that need a new or larger ignore zone -- see "Tuning
+  ignore zones" below.
 
 ## Threading model
 
@@ -99,8 +102,13 @@ cp config/secrets.yaml.example config/secrets.yaml
 # edit config/secrets.yaml with your camera's username/password
 ```
 
-Edit `config/settings.yaml` (or use the web UI once running) for the
-camera's host/port/path and the motion/recording/retention parameters.
+`config/settings.yaml` doesn't need to be created by hand -- the first time
+the app runs, it's seeded automatically from the checked-in
+`config/settings.example.yaml`. From then on it's yours to edit directly (or
+through the web UI, which writes back to the same file); it's gitignored,
+so local changes never show up as something to commit. Only
+`settings.example.yaml` is tracked in git, documenting every option with its
+default value.
 
 Run it:
 
@@ -109,8 +117,123 @@ python -m camera_watcher.main
 ```
 
 Then open `http://localhost:8080` for the web UI (Settings / Ignore Mask /
-Live Preview tabs) -- from a browser **on that same machine**. To reach it
-from a different device, see Troubleshooting below.
+Live Preview / Recordings tabs) -- from a browser **on that same machine**.
+To reach it from a different device, see Troubleshooting below.
+
+The Recordings tab groups clips into 30-minute buckets aligned to :00/:30
+(newest group first); clicking a clip streams it in the browser with
+play/pause and ±10 second seek buttons (native scrubbing via the video's own
+controls too). Each clip has its own "Delete" button, and each group header
+has a "Delete all" button for clearing a whole half-hour at once -- both ask
+for confirmation first. Neither waits on retention. The Ignore Mask tab
+lists drawn shapes alongside the canvas -- click one to highlight it, then
+"Delete selected shape" to remove just that one.
+
+The header's "Stop Server" button asks you to type `quit` to confirm, then
+cleanly shuts the whole process down (capture, recording, retention, the
+heatmap accumulator all stop/flush the same way as Ctrl+C does in the
+terminal). If you're running this under something that auto-restarts
+crashed/exited processes (a systemd unit with `Restart=always`, `docker run
+--restart unless-stopped`, etc.), it'll just come back up -- stop it at that
+supervisor level too if you actually want it to stay down.
+
+## Updating from the web UI
+
+The header's "Update & Restart" button asks you to type `update` to confirm,
+then:
+
+1. Runs `git pull --ff-only` in the checkout this process is running from.
+   Fast-forward only -- it refuses (and reports an error, without touching
+   anything else) rather than creating a merge commit or discarding local
+   history if the branch has diverged.
+2. If nothing changed, it stops there and tells you you're already current
+   -- no restart.
+3. If it pulled something, it reinstalls `requirements.txt` with the same
+   Python environment the server is already running under. If that fails,
+   it stops there too and reports the error, deliberately **not**
+   restarting into a checkout whose dependencies didn't install cleanly.
+4. Only once both steps succeed does it restart: it cleanly stops the
+   pipeline (same as the Stop Server button) and then re-execs itself in
+   place (`os.execv`, same process ID, no supervisor required), which picks
+   up the newly pulled code on the way back up. The page polls until the
+   server responds again and reloads itself automatically.
+
+Since `config/settings.yaml`/`secrets.yaml`/`mask.json` are all gitignored
+(see below), a `git pull` here can't collide with anything you've configured
+through the UI -- only tracked source files are affected.
+
+**Worth knowing**: like every other button in this UI, `/api/update` has no
+authentication -- anyone who can reach the web UI can trigger it, and it
+runs whatever code is at the tip of your branch upstream. That's consistent
+with the rest of this tool (no login anywhere), but is worth keeping in mind
+if this is reachable beyond a trusted LAN.
+
+## Tuning ignore zones: drawing past the edge, the heatmap, and event log
+
+Three features work together for diagnosing "this ignore zone isn't working"
+(e.g. something at the edge of frame -- a flag, a tree branch -- keeps
+triggering clips despite being outlined):
+
+- **Draw past the image edge.** The Ignore Mask canvas is shown larger than
+  the actual camera image, with a shaded margin around it (the dashed line
+  marks the real frame boundary). Points placed in that margin are still
+  saved and still apply -- useful for fully enclosing something that sways
+  at or past the edge of the visible frame, which a shape confined to the
+  visible image alone can't do.
+- **Motion heatmap.** Check "Show motion heatmap" on the Ignore Mask tab to
+  overlay where motion has fired, most-frequent spots most opaque. Unlike
+  ordinary detection, this reflects *all* raw motion, including inside
+  zones you've already marked ignored -- so it stays useful for confirming
+  an existing ignore zone actually covers a spot's full range of motion.
+  It **never decays or resets on its own** -- it's a running total from a
+  persisted file (`motion.heatmap_path`, default `data/motion_heatmap.npy`)
+  until you click "Reset heatmap."
+- **Per-clip motion log.** Every finalized clip appends one line to
+  `recording.event_log_path` (default `data/motion_events.jsonl`) with its
+  timestamp, filename, and the overall bounding box of what triggered it --
+  e.g. `{"timestamp": ..., "camera": "camera1", "clip": "camera1_....mp4",
+  "bbox": [x, y, w, h]}`. Set it to `""` to disable. Useful for scripting a
+  review of which regions keep triggering recordings over time.
+
+## Bounding boxes on recorded video
+
+`motion.draw_bounding_box` (off by default, toggleable from Settings) burns
+a bright green box around detected motion into recorded frames, padded
+`motion.box_padding_px` away from the contour so it doesn't obscure the
+moving object itself. It's meant as a tuning/testing aid -- turn it on while
+dialing in sensitivity and ignore zones, then back off so future recordings
+stay unannotated for any later analysis stage. It only affects frames
+recorded *after* motion starts within an event; prepended pre-roll frames
+(already captured before detection fired) are written as originally
+captured.
+
+## Companion metadata for each clip
+
+Every finalized clip gets a same-named `.json` file alongside it (e.g.
+`camera1_20260117_140030.mp4` -> `camera1_20260117_140030.json`) -- written
+right after the video finishes, deleted along with it (retention, single
+delete, and group delete all remove both together):
+
+```json
+{
+  "event_id": "camera1_20260117_140030",
+  "camera_id": "camera1",
+  "start_time": "2026-01-17T14:00:28.512340-05:00",
+  "end_time": "2026-01-17T14:00:42.881230-05:00",
+  "video_path": "/abs/path/to/data/clips/camera1_20260117_140030.mp4",
+  "motion_confidence": {"mean_score": 812.4, "max_score": 2350.0, "motion_frame_ratio": 0.6667},
+  "motion_time": 8.0,
+  "detection_size": 0.1
+}
+```
+
+- **event_id**: the clip's filename stem (camera name + timestamp combined) -- a stable, unique key for this event.
+- **camera_id**: the configured camera name.
+- **start_time** / **end_time**: ISO 8601 with UTC offset, covering the *actual* written content -- including the pre-buffer prepended at the start and any post-buffer cooldown at the end, not just the moment motion was first confirmed.
+- **video_path**: absolute path to the clip.
+- **motion_confidence**: this detector uses background subtraction + contour area, not a neural net, so there's no built-in 0-1 probability -- instead: `mean_score`/`max_score` are the average/peak raw per-frame motion score (contour area) across frames where motion was actually detected, and `motion_frame_ratio` is the fraction of all frames in the clip that had motion detected at all, as a proxy for how consistent the detection was through the clip.
+- **motion_time**: total seconds (not a fraction) where motion was detected, summed across the live portion of the clip -- 4 decimal places.
+- **detection_size**: the largest single detected contour's bounding-box area as a fraction of the frame (e.g. `0.1` = the biggest detection covered 10% of the image at its peak) -- 4 decimal places.
 
 ### Missing dependencies
 
@@ -123,21 +246,38 @@ third-party dependencies at all and can run standalone with just Python 3.
 
 ## Credentials -- please read
 
-Camera credentials are **never** stored in `config/settings.yaml` (which is
-safe to commit) and always go in `config/secrets.yaml`, which is listed in
-`.gitignore` and must never be committed. Only `config/secrets.yaml.example`
-(with blank values) is tracked in git. The web UI's password field never
-echoes back the stored password -- it always displays blank, and leaving it
-blank on save keeps the existing value.
+Camera credentials are **never** stored in `config/settings.yaml` and always
+go in `config/secrets.yaml` instead, kept as a separate file so the two
+can't accidentally get mixed up. Both files are gitignored (see "Local
+config, not checked into git" below) -- neither is ever meant to be
+committed. Only `config/secrets.yaml.example` (with blank values) is tracked
+in git. The web UI's password field never echoes back the stored password --
+it always displays blank, and leaving it blank on save keeps the existing
+value.
 
 Before committing, double check `git status` doesn't show
-`config/secrets.yaml`, `config/mask.json`, or anything under `data/`.
+`config/settings.yaml`, `config/secrets.yaml`, `config/mask.json`, or
+anything under `data/`.
+
+## Local config, not checked into git
+
+Everything this app writes to disk on its own -- `config/settings.yaml`,
+`config/secrets.yaml`, `config/mask.json`, the motion heatmap, event log,
+and recorded clips under `data/` -- is gitignored. Only checked-in
+*templates* live in git:
+
+| Tracked template (safe to commit) | Local file it produces (gitignored) |
+| --- | --- |
+| `config/settings.example.yaml` | `config/settings.yaml` -- auto-copied the first time the app runs, so it starts with every documented default already in place |
+| `config/mask.example.json` | `config/mask.json` -- *not* auto-copied (its sample polygon is just a format example, not a sensible default for your camera); starts with no ignore zones and is created once you draw and save your first shape |
+| `config/secrets.yaml.example` | `config/secrets.yaml` -- copy it yourself and fill in real credentials (see Setup above); there's no safe default to seed it with |
 
 ## Configuration reference
 
-See `config/settings.yaml` for the full set of options with inline comments,
-covering camera connection, motion sensitivity, recording buffer/chunk/
-overlap timing, retention limits, and the web server.
+See `config/settings.example.yaml` for the full set of options with inline
+comments, covering camera connection, motion sensitivity, recording
+buffer/chunk/overlap timing, retention limits, and the web server -- your
+actual `config/settings.yaml` starts as a copy of it and has the same shape.
 
 ## Retention
 

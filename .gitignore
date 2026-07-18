@@ -217,7 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# camera_watcher: never commit camera credentials or captured video/state
+# camera_watcher: never commit camera credentials, locally-edited config, or captured video/state
+config/settings.yaml
 config/secrets.yaml
 config/mask.json
 data/

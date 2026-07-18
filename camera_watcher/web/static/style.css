@@ -50,6 +50,48 @@ nav { display: flex; gap: 0.5rem; flex: 1; }
 .status-badge.bad { border-color: #b3261e; color: #b3261e; }
 .status-badge.rec { border-color: #b3261e; background: #b3261e22; }
 
+.danger-btn {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #b3261e;
+  border-radius: 6px;
+  background: transparent;
+  color: #b3261e;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.danger-btn:hover { background: #b3261e; color: white; }
+.danger-btn:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; color: #b3261e; }
+
+.shutdown-banner {
+  background: #b3261e;
+  color: white;
+  text-align: center;
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+}
+
+.update-btn {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.update-btn:hover { background: var(--accent); color: white; }
+.update-btn:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; color: var(--accent); }
+
+.update-banner {
+  background: var(--accent);
+  color: white;
+  text-align: center;
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+}
+
 main { padding: 1rem; }
 
 .tab { display: none; }
@@ -100,17 +142,175 @@ button[type="submit"], .mask-toolbar button {
   flex-wrap: wrap;
 }
 
+.inline-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.inline-checkbox input[type="checkbox"] { margin: 0; }
+
+.mask-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
 #mask-canvas {
   max-width: 100%;
+  flex: 1 1 auto;
   border: 1px solid var(--border);
   cursor: crosshair;
   touch-action: none;
+}
+
+.shape-panel {
+  flex: 0 0 14rem;
+  min-width: 12rem;
+}
+
+.shape-panel ul {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+.shape-panel li {
+  padding: 0.4rem 0.6rem;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.shape-panel li:last-child { border-bottom: none; }
+.shape-panel li:hover { background: #8882; }
+.shape-panel li.selected { background: var(--accent); color: white; }
+
+#delete-selected-shape {
+  width: 100%;
+  padding: 0.5rem;
+  border: none;
+  border-radius: 6px;
+  background: #b3261e;
+  color: white;
+  cursor: pointer;
+}
+
+#delete-selected-shape:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 #preview-img {
   max-width: 100%;
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+
+.recordings-layout {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.recordings-list { flex: 1 1 16rem; min-width: 14rem; }
+
+.recordings-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+.recordings-list li {
+  padding: 0.5rem 0.7rem;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.recordings-list li:last-child { border-bottom: none; }
+.recordings-list li:hover { background: #8882; }
+.recordings-list li.hint { cursor: default; }
+.recordings-list li.hint:hover { background: none; }
+
+.recordings-list li.recording-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  cursor: default;
+}
+
+.recording-info {
+  cursor: pointer;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-delete {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid #b3261e;
+  border-radius: 4px;
+  background: transparent;
+  color: #b3261e;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.recording-delete:hover { background: #b3261e; color: white; }
+
+.recordings-list li.group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  background: #8882;
+  font-weight: 600;
+  font-size: 0.78rem;
+  cursor: default;
+}
+
+.recordings-list li.group-header:hover { background: #8882; }
+
+.recordings-player { flex: 2 1 20rem; min-width: 16rem; }
+
+#recording-video {
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: black;
+}
+
+.video-controls {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.video-controls button {
+  padding: 0.4rem 0.9rem;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
 }
 
 #settings-status, #mask-status {
