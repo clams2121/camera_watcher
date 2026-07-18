@@ -1,4 +1,4 @@
-"""Wires capture, motion detection, recording, and retention into one running service.
+"""Wires capture, motion detection, and recording into one running service.
 
 Threading model: each stage runs on its own thread so a slow one never stalls
 another --
@@ -9,7 +9,11 @@ another --
   and does the actually-slow work: motion detection and writing video to
   disk. It's decoupled from capture via ``_frame_queue`` so a slow disk
   write never backs up the RTSP read loop.
-- The retention sweep runs on its own timer thread.
+- A small timer thread periodically persists the motion heatmap
+  accumulator. Retention is no longer an in-process thread here at all --
+  see deploy/camera-retention.service + .timer, which sweep the whole
+  fleet's shared data_root on a schedule instead (see retention.py's
+  enforce_global_retention).
 - The Flask web UI runs on the main thread (via a threaded WSGI server), so
   it keeps answering requests regardless of what the other threads are
   doing -- it never touches the camera directly, only the shared,
@@ -35,7 +39,6 @@ from .frame_buffer import FrameBuffer
 from .mask import MaskStore
 from .motion import MotionDetector
 from .recorder import TEMP_SUFFIX, BoundingBox, RecorderConfig, SegmentRecorder
-from .retention import RetentionConfig, enforce_retention
 from .segment_cache import SegmentCache, SegmentCacheConfig
 
 logger = logging.getLogger(__name__)
@@ -49,10 +52,13 @@ _BOX_COLOR = (0, 255, 0)  # bright green
 # normal frame-interval jitter, not any particular pre/post-buffer length.
 _PREVIEW_BUFFER_SECONDS = 5.0
 
+_HEATMAP_PERSIST_INTERVAL_SECONDS = 300  # 5 minutes
+
 
 class CameraPipeline:
-    """Owns the capture thread, motion detector, recorder, segment cache, and
-    retention sweep for one camera."""
+    """Owns the capture thread, motion detector, recorder, and segment cache
+    for one camera. Retention is handled externally -- see
+    deploy/camera-retention.service + .timer."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -97,8 +103,8 @@ class CameraPipeline:
             on_frame=self._on_frame,
         )
 
-        self._retention_stop = threading.Event()
-        self._retention_thread: Optional[threading.Thread] = None
+        self._heatmap_persist_stop = threading.Event()
+        self._heatmap_persist_thread: Optional[threading.Thread] = None
 
         # Bounded so a stalled disk (or a burst the processing thread can't
         # keep up with) sheds frames instead of growing memory without limit.
@@ -293,13 +299,13 @@ class CameraPipeline:
         self._process_thread = threading.Thread(target=self._process_loop, name="frame-processor", daemon=True)
         self._process_thread.start()
         self.capture.start()
-        self._start_retention_thread()
+        self._start_heatmap_persist_thread()
         self._start_prune_thread()
 
     def stop(self) -> None:
-        self._retention_stop.set()
-        if self._retention_thread:
-            self._retention_thread.join(timeout=5)
+        self._heatmap_persist_stop.set()
+        if self._heatmap_persist_thread:
+            self._heatmap_persist_thread.join(timeout=5)
         self._prune_stop.set()
         if self._prune_thread:
             self._prune_thread.join(timeout=5)
@@ -357,39 +363,25 @@ class CameraPipeline:
         if self.accumulator is not None:
             self.accumulator.reset()
 
-    def _start_retention_thread(self) -> None:
+    def _start_heatmap_persist_thread(self) -> None:
+        # The motion heatmap accumulator is also saved on clean shutdown and
+        # on reset -- this just keeps it from losing more than a few
+        # minutes' worth of data to an unclean stop (a crash, `kill -9`).
         def _run():
-            while not self._retention_stop.is_set():
-                settings = self.config.resolved()
-                retention_cfg = settings["retention"]
-                if retention_cfg["enabled"]:
-                    try:
-                        enforce_retention(
-                            RetentionConfig(
-                                output_dir=Path(settings["recording"]["output_dir"]),
-                                max_age_days=retention_cfg["max_age_days"],
-                                max_total_gb=retention_cfg["max_total_gb"],
-                            )
-                        )
-                    except Exception:
-                        logger.exception("Retention sweep failed")
-                # Piggyback the heatmap accumulator's periodic persistence on
-                # this same timer rather than running a whole extra thread
-                # for it -- it's also saved on clean shutdown and on reset.
+            while not self._heatmap_persist_stop.is_set():
                 if self.accumulator is not None:
                     try:
                         self.accumulator.save()
                     except Exception:
                         logger.exception("Failed to persist the motion heatmap accumulator")
-                interval = max(retention_cfg.get("check_interval_seconds", 3600), 60)
-                if self._retention_stop.wait(interval):
+                if self._heatmap_persist_stop.wait(_HEATMAP_PERSIST_INTERVAL_SECONDS):
                     break
 
-        self._retention_thread = threading.Thread(target=_run, name="retention", daemon=True)
-        self._retention_thread.start()
+        self._heatmap_persist_thread = threading.Thread(target=_run, name="heatmap-persist", daemon=True)
+        self._heatmap_persist_thread.start()
 
     def _start_prune_thread(self) -> None:
-        # Separate, short-interval timer from the retention sweep above --
+        # Separate, short-interval timer from the heatmap persistence above --
         # the passthrough segment cache is a small rolling buffer that needs
         # pruning every few seconds, not something swept once an hour.
         def _run():

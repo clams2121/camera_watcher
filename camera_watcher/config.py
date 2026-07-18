@@ -93,12 +93,10 @@ DEFAULTS: dict[str, Any] = {
         "max_chunk_seconds": 180,
         "overlap_seconds": 5,
     },
-    "retention": {
-        "enabled": True,
-        "max_age_days": 14,
-        "max_total_gb": 50,
-        "check_interval_seconds": 3600,
-    },
+    # Retention is no longer configured per-camera -- see
+    # deploy/camera-retention.service + .timer, which sweep the whole
+    # fleet's shared data_root against one global budget instead (see
+    # retention.enforce_global_retention).
     "web": {
         # "tailscale" resolves this host's Tailscale IPv4 address at startup
         # (see tailscale.py) and binds only there -- fails loud rather than

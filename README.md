@@ -40,10 +40,10 @@ A separate pruning sweep keeps the segment cache trimmed to roughly
 `pre_buffer_seconds` of lookback, and never deletes a segment that's part of
 an open event's window or an assembly job that hasn't finished yet.
 
-A background sweep enforces the configured retention policy (max age and/or
-max total storage) on finalized clips, and a never-decaying motion heatmap
-plus a per-clip event log (bounding boxes) help spot zones that need a new
-or larger ignore zone -- see "Tuning ignore zones" below.
+Retention runs externally, outside this process entirely -- see "Retention"
+below. A never-decaying motion heatmap plus each clip's own metadata JSON
+(`bounding_box`, among other fields) help spot zones that need a new or
+larger ignore zone -- see "Tuning ignore zones" below.
 
 ### Camera setting that matters: I-frame interval
 
@@ -78,8 +78,9 @@ and the web UI stays responsive no matter what the camera is doing:
 - **Clip assembler thread**: motion-triggered ffmpeg concat calls run here,
   never on the frame-processing thread, so assembling a clip can never stall
   live motion detection.
-- **Cache pruner** and **retention sweep** each run on their own timer
-  thread.
+- **Cache pruner** and **heatmap persistence** each run on their own timer
+  thread. Retention is not one of this process's threads at all -- it's a
+  separate, standalone process (see "Retention" below).
 - **Web UI** (Flask) runs on the main thread with a threaded WSGI server, and
   only ever touches the shared, thread-safe frame buffer and config -- never
   the camera connection directly -- so `GET /` and the API always respond
@@ -193,6 +194,12 @@ To add a second camera, repeat the `cp` steps above with a new name and a
 different `web.port`, then run a second `python -m camera_watcher.main
 --config config/<name>.yaml` process.
 
+Running more than a couple of cameras by hand like this gets tedious fast --
+see `deploy/README.md` for running the whole fleet as systemd services
+(one `camera-watcher@<name>.service` instance per camera, restart-on-failure,
+sandboxing/hardening, plus the fleet-wide retention timer from "Retention"
+below).
+
 The Recordings tab groups clips into 30-minute buckets aligned to :00/:30
 (newest group first); clicking a clip streams it in the browser with
 play/pause and ±10 second seek buttons (native scrubbing via the video's own
@@ -203,9 +210,9 @@ lists drawn shapes alongside the canvas -- click one to highlight it, then
 "Delete selected shape" to remove just that one.
 
 The header's "Stop Server" button asks you to type `quit` to confirm, then
-cleanly shuts the whole process down (capture, recording, retention, the
-heatmap accumulator all stop/flush the same way as Ctrl+C does in the
-terminal). If you're running this under something that auto-restarts
+cleanly shuts the whole process down (capture, recording, the heatmap
+accumulator all stop/flush the same way as Ctrl+C does in the terminal).
+If you're running this under something that auto-restarts
 crashed/exited processes (a systemd unit with `Restart=always`, `docker run
 --restart unless-stopped`, etc.), it'll just come back up -- stop it at that
 supervisor level too if you actually want it to stay down.
@@ -395,17 +402,32 @@ its motion heatmap, and recorded clips (with their metadata sidecars) under
 
 See `config/camera.example.yaml` for the full set of options with inline
 comments, covering camera connection, motion sensitivity, recording
-buffer/chunk/overlap timing, retention limits, and the web server -- your
-actual `config/<name>.yaml` starts as a copy of it and has the same shape.
+buffer/chunk/overlap timing, and the web server -- your actual
+`config/<name>.yaml` starts as a copy of it and has the same shape.
+Retention is configured separately, fleet-wide -- see "Retention" below.
 
 ## Retention
 
-Retention runs as a periodic sweep inside this process by default
-(`retention.enabled`, `retention.max_age_days`, `retention.max_total_gb`).
-The sweep logic itself lives in `camera_watcher/retention.py` as a
-standalone function/CLI (`python -m camera_watcher.retention <clips_dir>
---max-age-days 14`), so a separate process/module can also invoke it
-directly against the same clips directory later.
+Retention is **not** configured per camera and does **not** run inside the
+camera process at all -- it's a standalone CLI
+(`camera_watcher/retention.py`, no third-party dependencies) meant to be
+invoked on a schedule against a whole fleet's shared `data_root`:
+
+```bash
+python -m camera_watcher.retention --global <data_root>/clips --max-age-days 14 --max-total-gb 500
+```
+
+`--global` sweeps every camera's subdirectory under `<data_root>/clips/`
+against **one shared budget** -- the globally oldest clips are deleted
+first once the combined total exceeds `--max-total-gb`, regardless of which
+camera they belong to, so one busy camera can't starve a quiet one's clips
+out of shared disk. (Omit `--global` and point it at one camera's own
+clips directory instead for the older, single-camera behavior.)
+
+See `deploy/` for the systemd timer that runs this automatically, and
+`retention.py`'s `classify_tier()` for the seam a future clip classifier
+will hook into here to prefer deleting low-value clips first, instead of
+pure oldest-first.
 
 ## Troubleshooting: can't reach the web UI from another device
 

@@ -101,3 +101,37 @@ def test_stop_drains_queued_frames_before_finalizing(tmp_path):
     pipeline._process_thread.join(timeout=2)
 
     assert len(processed) == 20  # nothing left unprocessed in the queue
+
+
+def test_full_lifecycle_starts_and_stops_every_thread_cleanly(tmp_path):
+    """Integration smoke test, no real camera needed: RTSP connects to a
+    port nothing is listening on and fails/retries in the background, the
+    same as against a genuinely unreachable camera. Just proves start()/
+    stop() bring up and tear down every thread (capture, frame processing,
+    passthrough segment cache, recorder assembler, cache pruner, heatmap
+    persistence -- retention is no longer one of them, see retention.py's
+    enforce_global_retention) without hanging or raising."""
+    path = tmp_path / "camera1.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "camera": {"name": "camera1", "host": "127.0.0.1", "port": 1},
+                "mask": {"path": str(tmp_path / "mask.json")},
+                "recording": {"output_dir": str(tmp_path / "clips"), "segment_seconds": 1},
+            }
+        )
+    )
+    pipeline = CameraPipeline(Config(path))
+    pipeline.start()
+    try:
+        assert _wait_until(
+            lambda: pipeline._heatmap_persist_thread is not None and pipeline._heatmap_persist_thread.is_alive()
+        )
+        assert pipeline._prune_thread is not None and pipeline._prune_thread.is_alive()
+        assert not hasattr(pipeline, "_retention_thread")
+    finally:
+        pipeline.stop()
+
+    assert not pipeline._heatmap_persist_thread.is_alive()
+    assert not pipeline._prune_thread.is_alive()
+    assert not pipeline._process_thread.is_alive()

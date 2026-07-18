@@ -62,12 +62,8 @@
           <label>Overlap between chunks (seconds) <input name="recording.overlap_seconds" type="number" min="0" max="60"></label>
         </fieldset>
 
-        <fieldset>
-          <legend>Retention</legend>
-          <label><input name="retention.enabled" type="checkbox"> Enabled</label>
-          <label>Max age (days) <input name="retention.max_age_days" type="number" min="0"></label>
-          <label>Max total storage (GB) <input name="retention.max_total_gb" type="number" min="0"></label>
-        </fieldset>
+        <p class="hint">Retention is configured fleet-wide, not per camera -- see
+          <code>deploy/camera-retention.service</code> / <code>.timer</code>.</p>
 
         <button type="submit">Save settings</button>
         <span id="settings-status"></span>

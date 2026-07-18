@@ -58,11 +58,9 @@ recording:
   max_chunk_seconds: 180 # hard cap per file (3 minutes)
   overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
 
-retention:
-  enabled: true
-  max_age_days: 14
-  max_total_gb: 50
-  check_interval_seconds: 3600
+# Retention is NOT configured here -- it's fleet-wide, not per camera, and
+# runs externally on a schedule against the whole shared data_root. See
+# deploy/camera-retention.service + .timer + deploy/README.
 
 web:
   # "tailscale" resolves this host's Tailscale IPv4 address at startup and

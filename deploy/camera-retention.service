@@ -1,0 +1,25 @@
+[Unit]
+Description=camera_watcher fleet-wide retention sweep
+Documentation=https://github.com/clams2121/camera_watcher
+
+[Service]
+Type=oneshot
+User=camera-watcher
+Group=camera-watcher
+WorkingDirectory=/opt/camera-watcher
+
+# --global sweeps every camera subdirectory under the given clips root
+# against ONE shared budget -- not per camera. Edit --max-age-days /
+# --max-total-gb to your fleet's real budget, or override them without
+# touching this file via a drop-in:
+#     sudo systemctl edit camera-retention.service
+ExecStart=/opt/camera-watcher/.venv/bin/python -m camera_watcher.retention \
+    --global /var/lib/camera-watcher/clips \
+    --max-age-days 14 \
+    --max-total-gb 500
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/camera-watcher
