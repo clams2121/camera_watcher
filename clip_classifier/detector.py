@@ -23,7 +23,8 @@ class Detection:
 
 
 class Detector(Protocol):
-    name: str
+    name: str  # "cpu" | "hailo"
+    model: str  # e.g. "yolov8n"
     model_version: str
 
     def detect(self, frame: np.ndarray) -> List[Detection]:

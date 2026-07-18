@@ -44,6 +44,7 @@ class HailoModelLoadError(Exception):
 
 class HailoYolov8Detector:
     name = "hailo"
+    model = "yolov8n"
 
     def __init__(self, hef_path: Path, confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR):
         # Imported here, not at module level -- see the module docstring.

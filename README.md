@@ -559,16 +559,68 @@ below. `config/classifier.example.yaml` documents every setting.
   it against).
 
 - **`auto`** (the default): uses Hailo if all three of the above are
-  present, otherwise falls back to CPU -- loudly, both in the logs and
-  reflected in the classifier's own status output. `backend: hailo`
-  explicitly, by contrast, never falls back -- it fails loud listing
-  exactly what's missing.
+  present, otherwise falls back to CPU -- loudly logged either way.
+  `backend: hailo` explicitly, by contrast, never falls back -- it fails
+  loud listing exactly what's missing.
 
 Either way, detections come back as label + confidence + a normalized
 `(x, y, w, h)` box, backend-agnostic -- see `clip_classifier/detector.py`.
 Target classes for a "high" verdict: `person`, the vehicle classes (car,
 truck, bus, motorcycle, bicycle), and the COCO animal classes -- see
 `clip_classifier/labels.py`.
+
+### The verdict sidecar (`<stem>.analysis.json`)
+
+Written once per clip, atomically (temp-write-then-rename, same pattern as
+the recorder's own metadata sidecar) -- its presence is what marks a clip
+"already classified" (see `clip_classifier/watcher.py`). The classifier is
+the sole writer of this file; it never touches the recorder's own
+`<stem>.json`.
+
+```json
+{
+  "event_id": "front-door_20260717_143052",
+  "schema_version": 1,
+  "verdict": "high",
+  "labels": [
+    {"label": "person", "confidence": 0.91, "box": [0.42, 0.31, 0.18, 0.44], "frame_offset": 8.0}
+  ],
+  "reason": "person>=0.5",
+  "sampled_frame_offsets": [2.0, 8.0, 8.9, 12.0],
+  "sampling_fallback": false,
+  "backend": "cpu",
+  "model": "yolov8n",
+  "model_version": "3f1a9c02e8b1",
+  "processed_at": "2026-07-17T14:31:05.331200+00:00",
+  "processing_seconds": 1.94
+}
+```
+
+- **verdict**: `high` (person/vehicle/animal, confident), `review` (nothing
+  recognized, but something's there a human should look at), `low`
+  (everything else), or `error` (couldn't be classified at all -- see
+  below). Never left unset: something that can't be processed still gets a
+  sidecar, with `verdict: "error"` and `reason` explaining why, so nothing
+  goes invisibly unclassified forever.
+- **labels**: every detection across every sampled frame, regardless of
+  verdict -- a "low" clip's incidental detections (a moth, a passing
+  shadow) are still visible here for later review/debugging.
+- **reason**: a short, machine-parsable string naming exactly which rule
+  fired -- `"<label>>=<threshold>"` for high, `"large_other:<label>"` /
+  `"persistent_detection"` / `"persistent_motion_no_detection"` for
+  review, `"no_target_or_notable_detections"` for low, or the error text
+  itself for `error`. Feeds the human review UI's reason display (see
+  below).
+- **sampled_frame_offsets**: which second-offsets into the clip actually
+  got decoded and fed to the detector (see `clip_classifier/sampling.py`)
+  -- only the ones that decoded successfully, not every offset attempted.
+- **sampling_fallback**: `true` if this clip's metadata sidecar was schema
+  v1 (or schema v2 with no usable motion timeline data), so frames were
+  sampled evenly across the clip instead of around motion peaks.
+- **backend** / **model** / **model_version**: which detector actually
+  produced this verdict and with what model file -- `model_version` is a
+  short hash of the model/HEF file, the same pattern as camera_watcher's
+  own `config_hash`/`mask_hash`.
 
 ## Tests
 

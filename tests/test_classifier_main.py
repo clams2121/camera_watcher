@@ -1,10 +1,12 @@
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
+import yaml
 
-from clip_classifier.main import _parse_args, run
+from clip_classifier.main import _parse_args, main, run
 from clip_classifier.watcher import ClipWatcher
 
 
@@ -145,3 +147,26 @@ def test_run_works_with_a_real_clip_watcher(tmp_path):
         assert processed == [clip]
     finally:
         watcher.stop()
+
+
+# ---------- main() fail-loud paths (never actually enters the blocking run() loop) ----------
+
+
+def test_main_fails_loud_on_a_missing_config_file(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["clip_classifier", "--config", "/does/not/exist.yaml"])
+    with pytest.raises(SystemExit):
+        main()
+    assert "cp config/classifier.example.yaml" in capsys.readouterr().err
+
+
+def test_main_fails_loud_when_the_cpu_backend_cannot_be_built(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "classifier.yaml"
+    config_path.write_text(yaml.safe_dump({"data_root": str(tmp_path / "data"), "backend": "cpu"}))
+    # cpu.model_path defaults to models/yolov8n.onnx, resolved relative to
+    # config_path's directory -- deliberately never created here.
+
+    monkeypatch.setattr(sys, "argv", ["clip_classifier", "--config", str(config_path)])
+    with pytest.raises(SystemExit):
+        main()
+
+    assert "fetch_model" in capsys.readouterr().err

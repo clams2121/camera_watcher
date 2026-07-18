@@ -159,6 +159,7 @@ class CpuYolov8Detector:
     """
 
     name = "cpu"
+    model = "yolov8n"
 
     def __init__(self, model_path: Path, confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR):
         # Imported here, not at module level, so importing this module --
