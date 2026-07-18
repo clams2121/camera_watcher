@@ -453,20 +453,55 @@ camera process at all -- it's a standalone CLI
 invoked on a schedule against a whole fleet's shared `data_root`:
 
 ```bash
-python -m camera_watcher.retention --global <data_root>/clips --max-age-days 14 --max-total-gb 500
+python -m camera_watcher.retention --global <data_root>/clips \
+    --low-max-age-hours 48 --high-max-age-days 30 --review-max-age-days 30 \
+    --max-total-gb 500
 ```
 
 `--global` sweeps every camera's subdirectory under `<data_root>/clips/`
-against **one shared budget** -- the globally oldest clips are deleted
-first once the combined total exceeds `--max-total-gb`, regardless of which
-camera they belong to, so one busy camera can't starve a quiet one's clips
-out of shared disk. (Omit `--global` and point it at one camera's own
-clips directory instead for the older, single-camera behavior.)
+against **one shared budget** -- the globally oldest, lowest-tier clips are
+deleted first once the combined total exceeds `--max-total-gb`, regardless
+of which camera they belong to, so one busy camera can't starve a quiet
+one's clips out of shared disk. (Omit `--global` and point it at one
+camera's own clips directory instead for the single-camera form.)
 
-See `deploy/` for the systemd timer that runs this automatically, and
-`retention.py`'s `classify_tier()` for the seam a future clip classifier
-will hook into here to prefer deleting low-value clips first, instead of
-pure oldest-first.
+### Verdict-aware tiers
+
+If `clip_classifier` (see below) is running against the same `data_root`,
+retention reads its `<stem>.analysis.json` verdict -- and, for `review`
+clips, any `<stem>.review.json` human decision -- to sort each clip into
+one of three tiers via `classify_tier()`, each with its own age window:
+
+| Tier | Which clips | Default window | Flag |
+| --- | --- | --- | --- |
+| `low` | verdict `low` | 48 hours | `--low-max-age-hours` |
+| `high` | verdict `high`, verdict `error`, no analysis sidecar yet (not-yet-classified), or verdict `review` with a `review.json` decision of `keep` | 30 days | `--high-max-age-days` |
+| `review` | verdict `review`, never reviewed | 30 days | `--review-max-age-days` |
+
+A clip clip_classifier hasn't reached yet (or choked on, `verdict:
+"error"`) is deliberately treated as `high`, not deleted early -- nothing
+gets treated as disposable just for being unclassified. Any window can be
+disabled with `0` (that tier's clips then only expire under the size
+budget, if any).
+
+Each window is checked first, unconditionally -- a clip past its own
+tier's age is always removed regardless of the size budget. Only then, if
+the fleet is still over `--max-total-gb`, does the size-budget phase run:
+`low` tier clips are deleted oldest-first, then -- only once every `low`
+clip is gone -- the oldest of whatever `high`/`review` clips remain,
+**logged as a warning** each time, since that means storage pressure is
+what took down a clip otherwise considered worth keeping, not its own
+age or a human's decision.
+
+A `review` clip that ages out of its window unreviewed is also logged as a
+warning (not just deleted quietly) -- that's a clip a human was meant to
+look at and never did.
+
+Either phase, once a clip is actually deleted, removes its whole sidecar
+family together: the recorder's `<stem>.json`, clip_classifier's
+`<stem>.analysis.json`, and any `<stem>.review.json`.
+
+See `deploy/` for the systemd timer that runs this automatically.
 
 ## Troubleshooting: can't reach the web UI from another device
 

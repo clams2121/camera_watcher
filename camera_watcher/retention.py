@@ -7,6 +7,12 @@ data_root, replacing what used to be an in-process thread per camera. This
 module intentionally has no third-party dependencies (unlike the rest of
 the project, it needs no OpenCV/Flask/PyYAML) so it can run standalone
 wherever Python 3 is available.
+
+Verdict-aware since clip_classifier exists: each clip is sorted into a
+retention tier (classify_tier below) by reading its <stem>.analysis.json /
+<stem>.review.json sidecars -- this module only ever reads them, never
+writes them (clip_classifier and camera_watcher.web.routes are the sole
+writers respectively).
 """
 from __future__ import annotations
 
@@ -22,31 +28,74 @@ from .constants import TEMP_SUFFIX
 
 logger = logging.getLogger(__name__)
 
+# Default per-tier age windows -- all independently configurable, see
+# RetentionConfig / enforce_global_retention / the CLI flags below.
+DEFAULT_LOW_MAX_AGE_HOURS = 48.0
+DEFAULT_HIGH_MAX_AGE_DAYS = 30.0
+DEFAULT_REVIEW_MAX_AGE_DAYS = 30.0
+
+_SIDECAR_SUFFIXES = (".json", ".analysis.json", ".review.json")
+
 
 @dataclass
 class RetentionConfig:
     output_dir: Path
-    max_age_days: Optional[float] = None
+    low_max_age_hours: Optional[float] = DEFAULT_LOW_MAX_AGE_HOURS
+    high_max_age_days: Optional[float] = DEFAULT_HIGH_MAX_AGE_DAYS
+    review_max_age_days: Optional[float] = DEFAULT_REVIEW_MAX_AGE_DAYS
     max_total_gb: Optional[float] = None
 
 
-def classify_tier(metadata: dict) -> str:
-    """Verdict-aware retention seam: always "unclassified" for now.
+def _sidecar_path(clip: Path, suffix: str) -> Path:
+    return clip.parent / f"{clip.stem}{suffix}"
 
-    Once a clip classifier exists (see the roadmap's tier-1 classifier),
-    this is where its stored verdict would be read back out of a clip's
-    metadata JSON, letting enforce_global_retention prioritize deleting
-    low-value clips before high-value ones under storage pressure instead
-    of pure oldest-first. A single constant return value today means
-    _TIER_DELETE_PRIORITY has no actual effect yet -- every clip sorts
-    equal on tier and falls back to age -- so wiring this in now doesn't
-    change current behavior at all.
+
+def _read_json_sidecar(path: Path) -> Optional[dict]:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        logger.warning("Failed to read %s -- treating it as absent", path)
+        return None
+
+
+def classify_tier(clip: Path) -> str:
+    """Sorts a clip into a retention tier by reading its classifier verdict
+    and (if any) human review decision -- "low", "review", or "high".
+
+    - No `<stem>.analysis.json` yet, or verdict == "error": "high". Fail
+      loud in the sense that matters here -- a clip clip_classifier hasn't
+      reached (or choked on) is never quietly treated as disposable, it's
+      kept at the same priority as a confirmed detection until proven
+      otherwise.
+    - verdict == "low": "low".
+    - verdict == "high": "high".
+    - verdict == "review": "review", UNLESS a `<stem>.review.json` sidecar
+      records decision == "keep", in which case a human already vouched
+      for it and it's promoted to "high". (decision == "discard" isn't
+      handled specially here since the web layer deletes the clip
+      immediately on discard -- there's normally nothing left to classify.)
     """
-    return "unclassified"
+    analysis = _read_json_sidecar(_sidecar_path(clip, ".analysis.json"))
+    verdict = analysis.get("verdict") if analysis else None
+
+    if verdict == "low":
+        return "low"
+    if verdict == "review":
+        review = _read_json_sidecar(_sidecar_path(clip, ".review.json"))
+        if review and review.get("decision") == "keep":
+            return "high"
+        return "review"
+    # verdict == "high", verdict == "error", or no analysis sidecar at all.
+    return "high"
 
 
-# Lower sorts first -- i.e. gets deleted first under a size budget.
-_TIER_DELETE_PRIORITY = {"low_value": 0, "unclassified": 1, "high_value": 2}
+# Lower sorts first -- i.e. gets deleted first under a size budget. "review"
+# and "high" share a priority: once every "low" clip is gone, budget
+# pressure deletes the oldest of whichever's left, high-value or not (see
+# _enforce_budget's logging when that happens).
+_TIER_DELETE_PRIORITY = {"low": 0, "review": 1, "high": 1}
 
 
 def _finalized_clips(output_dir: Path) -> List[Path]:
@@ -65,98 +114,143 @@ def _discover_camera_dirs(clips_root: Path) -> List[Path]:
     return [p for p in clips_root.iterdir() if p.is_dir()]
 
 
-def _read_metadata(clip: Path) -> dict:
-    try:
-        return json.loads(clip.with_suffix(".json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def _unlink_clip_and_metadata(clip: Path) -> None:
-    """Removes a clip and its companion <clip stem>.json metadata file, if
-    any. The metadata file is best-effort -- its absence/removal failure
-    doesn't stop the clip itself from being removed."""
+def _unlink_clip_and_sidecars(clip: Path) -> None:
+    """Removes a clip and its whole sidecar family: the recorder's own
+    <stem>.json, clip_classifier's <stem>.analysis.json, and any human
+    <stem>.review.json -- whichever of those exist. Each sidecar is
+    best-effort: a missing or unremovable one never stops the others (or
+    the clip itself) from being removed."""
     clip.unlink()
-    metadata_path = clip.with_suffix(".json")
-    try:
-        metadata_path.unlink(missing_ok=True)
-    except OSError:
-        logger.exception("Failed to remove metadata file %s", metadata_path)
+    for suffix in _SIDECAR_SUFFIXES:
+        sidecar_path = _sidecar_path(clip, suffix)
+        try:
+            sidecar_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to remove sidecar file %s", sidecar_path)
 
 
-def _sweep(clips: List[Path], max_age_days: Optional[float], max_total_gb: Optional[float], use_tiers: bool) -> List[Path]:
+def _tier_max_age_seconds(tier: str, cfg: RetentionConfig) -> Optional[float]:
+    if tier == "low":
+        return cfg.low_max_age_hours * 3600 if cfg.low_max_age_hours else None
+    if tier == "review":
+        return cfg.review_max_age_days * 86400 if cfg.review_max_age_days else None
+    return cfg.high_max_age_days * 86400 if cfg.high_max_age_days else None
+
+
+def _expire_by_age(clips: List[Path], cfg: RetentionConfig) -> List[Path]:
+    """Unconditionally removes clips past their own tier's age window --
+    runs before the size-budget phase, so "expired anything" always goes
+    first regardless of how much headroom is left in the budget."""
+    removed: List[Path] = []
+    now = time.time()
+    for clip in clips:
+        tier = classify_tier(clip)
+        max_age_seconds = _tier_max_age_seconds(tier, cfg)
+        if max_age_seconds is None:
+            continue
+        try:
+            age_seconds = now - clip.stat().st_mtime
+        except OSError:
+            continue
+        if age_seconds < max_age_seconds:
+            continue
+        if tier == "review":
+            logger.warning(
+                "Deleting a clip flagged for human review that was never reviewed -- aged past "
+                "the %.1f-day review window: %s",
+                cfg.review_max_age_days,
+                clip,
+            )
+        try:
+            _unlink_clip_and_sidecars(clip)
+            removed.append(clip)
+        except OSError:
+            logger.exception("Failed to remove expired clip %s", clip)
+    return removed
+
+
+def _enforce_budget(clips: List[Path], max_total_gb: Optional[float]) -> List[Path]:
+    """Deletes clips oldest-first within tier priority (low, then
+    review/high together) until the combined size of what's left is back
+    under budget. Logs a warning each time budget pressure -- not age or a
+    human decision -- is what took down a "high" or "review" tier clip."""
+    if not max_total_gb:
+        return []
+    max_bytes = max_total_gb * (1024**3)
+    clips_with_stat: List[Tuple[Path, "os.stat_result", str]] = []
+    for clip in clips:
+        try:
+            clips_with_stat.append((clip, clip.stat(), classify_tier(clip)))
+        except OSError:
+            continue
+    clips_with_stat.sort(key=lambda cst: (_TIER_DELETE_PRIORITY.get(cst[2], 1), cst[1].st_mtime))
+
+    total = sum(st.st_size for _, st, _ in clips_with_stat)
+    removed: List[Path] = []
+    i = 0
+    while total > max_bytes and i < len(clips_with_stat):
+        clip, st, tier = clips_with_stat[i]
+        if tier != "low":
+            logger.warning("Budget pressure is forcing deletion of a %s-tier clip: %s", tier, clip)
+        try:
+            _unlink_clip_and_sidecars(clip)
+            removed.append(clip)
+            total -= st.st_size
+        except OSError:
+            logger.exception("Failed to remove clip %s over storage limit", clip)
+        i += 1
+    return removed
+
+
+def _sweep(clips: List[Path], cfg: RetentionConfig) -> List[Path]:
     """Shared age-then-size sweep logic, used by both the single-directory
     and whole-fleet entry points below. Never touches in-progress
     recordings -- their filenames carry a temp suffix and are excluded by
     the callers' _finalized_clips -- so this is safe to run concurrently
     with an active recorder."""
-    removed: List[Path] = []
-
-    if max_age_days:
-        cutoff = time.time() - max_age_days * 86400
-        for clip in clips:
-            try:
-                if clip.stat().st_mtime < cutoff:
-                    _unlink_clip_and_metadata(clip)
-                    removed.append(clip)
-            except OSError:
-                logger.exception("Failed to remove expired clip %s", clip)
-    clips = [c for c in clips if c not in removed]
-
-    if max_total_gb:
-        max_bytes = max_total_gb * (1024**3)
-        clips_with_stat: List[Tuple[Path, "os.stat_result"]] = []
-        for clip in clips:
-            try:
-                clips_with_stat.append((clip, clip.stat()))
-            except OSError:
-                continue
-        if use_tiers:
-            clips_with_stat.sort(
-                key=lambda cs: (_TIER_DELETE_PRIORITY.get(classify_tier(_read_metadata(cs[0])), 1), cs[1].st_mtime)
-            )
-        else:
-            clips_with_stat.sort(key=lambda cs: cs[1].st_mtime)
-        total = sum(st.st_size for _, st in clips_with_stat)
-        i = 0
-        while total > max_bytes and i < len(clips_with_stat):
-            clip, st = clips_with_stat[i]
-            try:
-                _unlink_clip_and_metadata(clip)
-                removed.append(clip)
-                total -= st.st_size
-            except OSError:
-                logger.exception("Failed to remove clip %s over storage limit", clip)
-            i += 1
-
+    removed = _expire_by_age(clips, cfg)
+    remaining = [c for c in clips if c not in removed]
+    removed += _enforce_budget(remaining, cfg.max_total_gb)
     return removed
 
 
 def enforce_retention(config: RetentionConfig) -> List[Path]:
-    """Delete oldest finalized clips in a single directory exceeding
-    age/size limits. Returns files removed."""
-    removed = _sweep(_finalized_clips(config.output_dir), config.max_age_days, config.max_total_gb, use_tiers=False)
+    """Delete clips in a single directory past their tier's age window or
+    (once still over max_total_gb) oldest-within-tier-priority. Returns
+    files removed."""
+    removed = _sweep(_finalized_clips(config.output_dir), config)
     if removed:
         logger.info("Retention removed %d clip(s)", len(removed))
     return removed
 
 
 def enforce_global_retention(
-    clips_root: Path, max_age_days: Optional[float] = None, max_total_gb: Optional[float] = None
+    clips_root: Path,
+    low_max_age_hours: Optional[float] = DEFAULT_LOW_MAX_AGE_HOURS,
+    high_max_age_days: Optional[float] = DEFAULT_HIGH_MAX_AGE_DAYS,
+    review_max_age_days: Optional[float] = DEFAULT_REVIEW_MAX_AGE_DAYS,
+    max_total_gb: Optional[float] = None,
 ) -> List[Path]:
     """Sweeps every camera's clips subdirectory under `clips_root` (i.e.
     `<data_root>/clips/<camera_name>/` for however many cameras share this
-    data_root) against ONE shared budget. Age-based deletion is inherently
+    data_root) against ONE shared budget. Age-based expiry is inherently
     per-clip and camera-agnostic; the size budget is enforced across the
-    combined fleet -- lowest classify_tier priority, then oldest, first --
-    not per-camera, so one busy camera can't starve a quiet one's clips out
-    of a shared disk."""
+    combined fleet -- lowest tier priority, then oldest, first -- not
+    per-camera, so one busy camera can't starve a quiet one's clips out of
+    a shared disk."""
     camera_dirs = _discover_camera_dirs(clips_root)
     all_clips: List[Path] = []
     for camera_dir in camera_dirs:
         all_clips.extend(_finalized_clips(camera_dir))
 
-    removed = _sweep(all_clips, max_age_days, max_total_gb, use_tiers=True)
+    cfg = RetentionConfig(
+        output_dir=clips_root,
+        low_max_age_hours=low_max_age_hours,
+        high_max_age_days=high_max_age_days,
+        review_max_age_days=review_max_age_days,
+        max_total_gb=max_total_gb,
+    )
+    removed = _sweep(all_clips, cfg)
     if removed:
         logger.info("Global retention removed %d clip(s) across %d camera dir(s)", len(removed), len(camera_dirs))
     return removed
@@ -177,8 +271,27 @@ def _parse_args():
         help="Sweep every camera subdirectory under `path` against one shared budget, instead "
         "of treating `path` itself as one camera's clips directory.",
     )
-    parser.add_argument("--max-age-days", type=float, default=None)
-    parser.add_argument("--max-total-gb", type=float, default=None)
+    parser.add_argument(
+        "--low-max-age-hours",
+        type=float,
+        default=DEFAULT_LOW_MAX_AGE_HOURS,
+        help=f"Max age for verdict=low clips, in hours (default {DEFAULT_LOW_MAX_AGE_HOURS}). 0 disables.",
+    )
+    parser.add_argument(
+        "--high-max-age-days",
+        type=float,
+        default=DEFAULT_HIGH_MAX_AGE_DAYS,
+        help="Max age for verdict=high clips (and error/not-yet-classified/review+keep, which are "
+        f"treated as high), in days (default {DEFAULT_HIGH_MAX_AGE_DAYS}). 0 disables.",
+    )
+    parser.add_argument(
+        "--review-max-age-days",
+        type=float,
+        default=DEFAULT_REVIEW_MAX_AGE_DAYS,
+        help="Max age for verdict=review clips that were never reviewed, in days "
+        f"(default {DEFAULT_REVIEW_MAX_AGE_DAYS}). 0 disables.",
+    )
+    parser.add_argument("--max-total-gb", type=float, default=None, help="Shared size budget in GB. Omit for none.")
     return parser.parse_args()
 
 
@@ -186,10 +299,22 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = _parse_args()
     if args.global_mode:
-        removed = enforce_global_retention(args.path, max_age_days=args.max_age_days, max_total_gb=args.max_total_gb)
+        removed = enforce_global_retention(
+            args.path,
+            low_max_age_hours=args.low_max_age_hours,
+            high_max_age_days=args.high_max_age_days,
+            review_max_age_days=args.review_max_age_days,
+            max_total_gb=args.max_total_gb,
+        )
     else:
         removed = enforce_retention(
-            RetentionConfig(output_dir=args.path, max_age_days=args.max_age_days, max_total_gb=args.max_total_gb)
+            RetentionConfig(
+                output_dir=args.path,
+                low_max_age_hours=args.low_max_age_hours,
+                high_max_age_days=args.high_max_age_days,
+                review_max_age_days=args.review_max_age_days,
+                max_total_gb=args.max_total_gb,
+            )
         )
     for clip in removed:
         print(clip)

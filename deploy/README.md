@@ -80,20 +80,26 @@ sudo systemctl enable --now camera-retention.timer
 systemctl list-timers camera-retention.timer   # confirm it's scheduled
 ```
 
-`camera-retention.service`'s `ExecStart` bakes in a default
-`--max-age-days 14 --max-total-gb 500` -- edit that line directly, or
-override without touching the tracked file via a drop-in:
+`camera-retention.service`'s `ExecStart` bakes in defaults of
+`--low-max-age-hours 48 --high-max-age-days 30 --review-max-age-days 30
+--max-total-gb 500` -- edit that line directly, or override without
+touching the tracked file via a drop-in:
 
 ```bash
 sudo systemctl edit camera-retention.service
 ```
 
-Retention deletes the globally oldest clips first once the shared budget is
-exceeded (not per camera, so one busy camera can't starve a quiet one), with
-one seam already wired in for later: `classify_tier()` in
-`camera_watcher/retention.py` currently always returns `"unclassified"`, but
-once a clip classifier exists (see the project roadmap) its verdict will
-feed into this same sweep to prefer deleting low-value clips first.
+Retention is verdict-aware: each clip's `clip_classifier` verdict (and any
+human review decision, if the clip landed in `review`) sorts it into a
+retention tier via `classify_tier()` in `camera_watcher/retention.py` --
+`low`, `review`, or `high` (also used for `error`/not-yet-classified clips
+and `review` clips a human has kept, so nothing gets treated as disposable
+just because it hasn't been looked at). Each tier expires on its own age
+window; once the shared size budget is still exceeded after that, `low`
+tier clips go first, oldest first, then the oldest of whatever `high`/
+`review` clips remain -- logged loudly, since that means budget pressure
+is deleting something otherwise considered worth keeping. See the root
+README's "Retention" section for the full tier/window breakdown.
 
 ## 5. Hardening notes
 
