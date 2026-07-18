@@ -44,6 +44,10 @@ class RetentionConfig:
     high_max_age_days: Optional[float] = DEFAULT_HIGH_MAX_AGE_DAYS
     review_max_age_days: Optional[float] = DEFAULT_REVIEW_MAX_AGE_DAYS
     max_total_gb: Optional[float] = None
+    # When true, nothing is actually deleted -- everything that would have
+    # been removed (and why) is still computed and logged/returned, just
+    # with the unlink calls skipped. See _expire_by_age/_enforce_budget.
+    dry_run: bool = False
 
 
 def _sidecar_path(clip: Path, suffix: str) -> Path:
@@ -140,7 +144,10 @@ def _tier_max_age_seconds(tier: str, cfg: RetentionConfig) -> Optional[float]:
 def _expire_by_age(clips: List[Path], cfg: RetentionConfig) -> List[Path]:
     """Unconditionally removes clips past their own tier's age window --
     runs before the size-budget phase, so "expired anything" always goes
-    first regardless of how much headroom is left in the budget."""
+    first regardless of how much headroom is left in the budget. Under
+    dry_run, everything that would have been removed is still computed
+    and logged, just never actually unlinked."""
+    verb = "Would remove" if cfg.dry_run else "Removing"
     removed: List[Path] = []
     now = time.time()
     for clip in clips:
@@ -156,11 +163,15 @@ def _expire_by_age(clips: List[Path], cfg: RetentionConfig) -> List[Path]:
             continue
         if tier == "review":
             logger.warning(
-                "Deleting a clip flagged for human review that was never reviewed -- aged past "
+                "%s a clip flagged for human review that was never reviewed -- aged past "
                 "the %.1f-day review window: %s",
+                verb,
                 cfg.review_max_age_days,
                 clip,
             )
+        if cfg.dry_run:
+            removed.append(clip)
+            continue
         try:
             _unlink_clip_and_sidecars(clip)
             removed.append(clip)
@@ -169,13 +180,16 @@ def _expire_by_age(clips: List[Path], cfg: RetentionConfig) -> List[Path]:
     return removed
 
 
-def _enforce_budget(clips: List[Path], max_total_gb: Optional[float]) -> List[Path]:
+def _enforce_budget(clips: List[Path], max_total_gb: Optional[float], dry_run: bool) -> List[Path]:
     """Deletes clips oldest-first within tier priority (low, then
     review/high together) until the combined size of what's left is back
     under budget. Logs a warning each time budget pressure -- not age or a
-    human decision -- is what took down a "high" or "review" tier clip."""
+    human decision -- is what took down a "high" or "review" tier clip.
+    Under dry_run, sizes are still tallied against the budget so the
+    dry-run output reflects real deletion order, just without unlinking."""
     if not max_total_gb:
         return []
+    verb = "Would forcibly delete" if dry_run else "Budget pressure is forcing deletion of"
     max_bytes = max_total_gb * (1024**3)
     clips_with_stat: List[Tuple[Path, "os.stat_result", str]] = []
     for clip in clips:
@@ -191,7 +205,12 @@ def _enforce_budget(clips: List[Path], max_total_gb: Optional[float]) -> List[Pa
     while total > max_bytes and i < len(clips_with_stat):
         clip, st, tier = clips_with_stat[i]
         if tier != "low":
-            logger.warning("Budget pressure is forcing deletion of a %s-tier clip: %s", tier, clip)
+            logger.warning("%s a %s-tier clip: %s", verb, tier, clip)
+        if dry_run:
+            removed.append(clip)
+            total -= st.st_size
+            i += 1
+            continue
         try:
             _unlink_clip_and_sidecars(clip)
             removed.append(clip)
@@ -210,17 +229,19 @@ def _sweep(clips: List[Path], cfg: RetentionConfig) -> List[Path]:
     with an active recorder."""
     removed = _expire_by_age(clips, cfg)
     remaining = [c for c in clips if c not in removed]
-    removed += _enforce_budget(remaining, cfg.max_total_gb)
+    removed += _enforce_budget(remaining, cfg.max_total_gb, cfg.dry_run)
     return removed
 
 
 def enforce_retention(config: RetentionConfig) -> List[Path]:
     """Delete clips in a single directory past their tier's age window or
     (once still over max_total_gb) oldest-within-tier-priority. Returns
-    files removed."""
+    files removed (or, under config.dry_run, files that WOULD have been
+    removed -- nothing is actually touched)."""
     removed = _sweep(_finalized_clips(config.output_dir), config)
     if removed:
-        logger.info("Retention removed %d clip(s)", len(removed))
+        verb = "would remove" if config.dry_run else "removed"
+        logger.info("Retention %s %d clip(s)", verb, len(removed))
     return removed
 
 
@@ -230,6 +251,7 @@ def enforce_global_retention(
     high_max_age_days: Optional[float] = DEFAULT_HIGH_MAX_AGE_DAYS,
     review_max_age_days: Optional[float] = DEFAULT_REVIEW_MAX_AGE_DAYS,
     max_total_gb: Optional[float] = None,
+    dry_run: bool = False,
 ) -> List[Path]:
     """Sweeps every camera's clips subdirectory under `clips_root` (i.e.
     `<data_root>/clips/<camera_name>/` for however many cameras share this
@@ -237,7 +259,8 @@ def enforce_global_retention(
     per-clip and camera-agnostic; the size budget is enforced across the
     combined fleet -- lowest tier priority, then oldest, first -- not
     per-camera, so one busy camera can't starve a quiet one's clips out of
-    a shared disk."""
+    a shared disk. Under dry_run, nothing is actually deleted -- see
+    RetentionConfig.dry_run."""
     camera_dirs = _discover_camera_dirs(clips_root)
     all_clips: List[Path] = []
     for camera_dir in camera_dirs:
@@ -249,10 +272,12 @@ def enforce_global_retention(
         high_max_age_days=high_max_age_days,
         review_max_age_days=review_max_age_days,
         max_total_gb=max_total_gb,
+        dry_run=dry_run,
     )
     removed = _sweep(all_clips, cfg)
     if removed:
-        logger.info("Global retention removed %d clip(s) across %d camera dir(s)", len(removed), len(camera_dirs))
+        verb = "would remove" if dry_run else "removed"
+        logger.info("Global retention %s %d clip(s) across %d camera dir(s)", verb, len(removed), len(camera_dirs))
     return removed
 
 
@@ -292,6 +317,11 @@ def _parse_args():
         f"(default {DEFAULT_REVIEW_MAX_AGE_DAYS}). 0 disables.",
     )
     parser.add_argument("--max-total-gb", type=float, default=None, help="Shared size budget in GB. Omit for none.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and print/log what would be removed (and why) without deleting anything.",
+    )
     return parser.parse_args()
 
 
@@ -305,6 +335,7 @@ def main() -> None:
             high_max_age_days=args.high_max_age_days,
             review_max_age_days=args.review_max_age_days,
             max_total_gb=args.max_total_gb,
+            dry_run=args.dry_run,
         )
     else:
         removed = enforce_retention(
@@ -314,10 +345,12 @@ def main() -> None:
                 high_max_age_days=args.high_max_age_days,
                 review_max_age_days=args.review_max_age_days,
                 max_total_gb=args.max_total_gb,
+                dry_run=args.dry_run,
             )
         )
+    prefix = "[dry-run] would remove: " if args.dry_run else ""
     for clip in removed:
-        print(clip)
+        print(f"{prefix}{clip}")
 
 
 if __name__ == "__main__":

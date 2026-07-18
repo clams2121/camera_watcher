@@ -1,9 +1,12 @@
 # Deploying camera_watcher as a systemd fleet
 
-One `camera-watcher@<name>.service` instance per camera, plus one shared
+One `camera-watcher@<name>.service` instance per camera, one shared
 `camera-retention.timer` sweeping every camera's clips against a single
-fleet-wide storage budget. This directory's unit files assume the layout
-below; adjust the paths in them (and in the commands here) if yours differs.
+fleet-wide storage budget, and (optionally) one `clip-classifier.service`
+instance -- watching the whole shared `data_root`, not per camera --
+running the tier-1 clip classifier. This directory's unit files assume the
+layout below; adjust the paths in them (and in the commands here) if yours
+differs.
 
 | Path | Purpose |
 | --- | --- |
@@ -101,38 +104,102 @@ tier clips go first, oldest first, then the oldest of whatever `high`/
 is deleting something otherwise considered worth keeping. See the root
 README's "Retention" section for the full tier/window breakdown.
 
-## 5. Hardening notes
+Before trusting any of this to the timer, dry-run it once with the exact
+flags from the unit file and read what it says it would do:
 
-Both unit files run as the unprivileged `camera-watcher` user with
-`ProtectSystem=strict`, `ProtectHome=true`, `NoNewPrivileges=true`, and an
-explicit `ReadWritePaths=` allowlist -- everything else on the filesystem is
+```bash
+sudo -u camera-watcher /opt/camera-watcher/.venv/bin/python -m camera_watcher.retention \
+    --global /var/lib/camera-watcher/clips \
+    --low-max-age-hours 48 --high-max-age-days 30 --review-max-age-days 30 \
+    --max-total-gb 500 --dry-run
+```
+
+## 5. Optional: deploy the clip classifier
+
+`clip-classifier.service` runs `clip_classifier` (see the root README's
+"Clip classifier (tier 1)" section) as a single instance watching the
+*whole* shared `data_root` -- not one per camera, and deliberately with no
+systemd `After=`/`Wants=` dependency on any `camera-watcher@*.service`, so
+it doesn't need the recorders up first and restarting/redeploying a camera
+never restarts or blocks it.
+
+Install its extra dependencies (on top of what step 2 already installed)
+and set up its config:
+
+```bash
+sudo -u camera-watcher /opt/camera-watcher/.venv/bin/pip install -r /opt/camera-watcher/requirements-classifier.txt
+sudo -u camera-watcher cp /opt/camera-watcher/config/classifier.example.yaml /opt/camera-watcher/config/classifier.yaml
+```
+
+Edit `classifier.yaml`: at minimum `data_root: /var/lib/camera-watcher`
+(the same shared root every camera writes clips into) and `backend` (`auto`
+by default -- uses the Hailo-8L if `/dev/hailo0` and its runtime are both
+present, otherwise falls back to the CPU/ONNX Runtime backend, loudly
+either way).
+
+The CPU backend needs a real model file fetched once (see the root
+README's "Detector backends" section for why `fetch_model.py` ships with
+no checksum baked in -- you pin it yourself, from a network that can
+actually reach the model host):
+
+```bash
+sudo -u camera-watcher /opt/camera-watcher/.venv/bin/python -m clip_classifier.fetch_model \
+    --config /opt/camera-watcher/config/classifier.yaml
+```
+
+Install and start the unit:
+
+```bash
+sudo cp deploy/clip-classifier.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now clip-classifier.service
+systemctl status clip-classifier.service
+journalctl -u clip-classifier.service -f
+```
+
+It backfills every already-finalized clip under `data_root` that doesn't
+have an `.analysis.json` sidecar yet on startup, then watches for new ones
+as cameras record them -- see the root README for the sidecar schema and
+the verdict rules.
+
+## 6. Hardening notes
+
+All three unit files (camera, retention, classifier) run as the
+unprivileged `camera-watcher` user with `ProtectSystem=strict`,
+`ProtectHome=true`, `NoNewPrivileges=true`, and an explicit
+`ReadWritePaths=` allowlist -- everything else on the filesystem is
 read-only to these services. If a service fails to start and the journal
 points at a hardening directive (most likely candidate:
-`MemoryDenyWriteExecute=true` in `camera-watcher@.service`, which some
-native library JIT paths can conflict with, though OpenCV/NumPy/ffmpeg
-don't), comment out that one line rather than loosening everything at once,
-so you know exactly what was needed.
+`MemoryDenyWriteExecute=true`, present in both `camera-watcher@.service`
+and `clip-classifier.service`, which some native library JIT paths can
+conflict with -- the CPU backend's ONNX Runtime is a plausible culprit for
+the classifier specifically, though OpenCV/NumPy/ffmpeg don't), comment out
+that one line rather than loosening everything at once, so you know
+exactly what was needed. If using the Hailo backend, `clip-classifier.service`
+will also need `/dev/hailo0` reachable, which may require a
+`DeviceAllow=` addition depending on your distro's udev/cgroup setup.
 
-`camera-watcher@.service` restarts on failure with `RestartSec=5`, capped at
-5 restarts per 5 minutes (`StartLimitIntervalSec`/`StartLimitBurst`) -- past
-that it stops retrying and `systemctl status` shows `start-limit-hit`,
-rather than spinning forever against a camera that's genuinely down.
-`systemctl reset-failed camera-watcher@<name>.service` clears that state
-once you've fixed the underlying problem.
+`camera-watcher@.service` and `clip-classifier.service` both restart on
+failure with `RestartSec=5`, capped at 5 restarts per 5 minutes
+(`StartLimitIntervalSec`/`StartLimitBurst`) -- past that they stop
+retrying and `systemctl status` shows `start-limit-hit`, rather than
+spinning forever against a camera (or model) that's genuinely broken.
+`systemctl reset-failed <unit>` clears that state once you've fixed the
+underlying problem.
 
-## 6. Adding/removing a camera later
+## 7. Adding/removing a camera later
 
 Adding: repeat step 3 for the new camera, then
 `sudo systemctl enable --now camera-watcher@<name>.service`. No changes
-needed to the retention timer -- it already sweeps every subdirectory under
-the shared `data_root`.
+needed to the retention timer or the classifier -- both already sweep/watch
+every subdirectory under the shared `data_root`.
 
 Removing: `sudo systemctl disable --now camera-watcher@<name>.service`, then
 delete `/opt/camera-watcher/config/<name>.{yaml,secrets.yaml,mask.json}` and
 that camera's clips under `/var/lib/camera-watcher/clips/<name>/` if you
 want them gone too (neither is automatic).
 
-## 7. Updating
+## 8. Updating
 
 `update.sh` at the repo root handles the whole fleet at once -- run it as
 the `camera-watcher` user from `/opt/camera-watcher`:
@@ -143,9 +210,13 @@ sudo -u camera-watcher /opt/camera-watcher/update.sh
 
 It fetches, fast-forwards (refusing to run at all against a dirty tree or a
 diverged branch), reinstalls dependencies, then restarts every
-`camera-watcher@*` instance it finds via `systemctl` and reports each one's
-resulting status -- see the root README's "Updating" section for the full
-behavior and failure modes. Since it calls `sudo systemctl restart` per
-instance, either run the whole script as root instead, or grant the
-`camera-watcher` user passwordless sudo scoped to just that command (e.g.
-via `visudo`: `camera-watcher ALL=(root) NOPASSWD: /usr/bin/systemctl restart camera-watcher@*`).
+`camera-watcher@*` instance it finds via `systemctl` -- plus
+`clip-classifier.service`, and its own extra dependencies from
+`requirements-classifier.txt`, if that's deployed on this host too -- and
+reports each one's resulting status. See the root README's "Updating"
+section for the full behavior and failure modes. Since it calls `sudo
+systemctl restart` per instance, either run the whole script as root
+instead, or grant the `camera-watcher` user passwordless sudo scoped to
+just that command (e.g. via `visudo`: `camera-watcher ALL=(root) NOPASSWD:
+/usr/bin/systemctl restart camera-watcher@*, /usr/bin/systemctl restart
+clip-classifier.service`).

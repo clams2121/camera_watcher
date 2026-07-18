@@ -1,0 +1,55 @@
+[Unit]
+Description=camera_watcher clip classifier (tier 1)
+Documentation=https://github.com/clams2121/camera_watcher
+
+# Deliberately no After=/Wants= on any camera-watcher@*.service: this
+# watches data_root's clips directories for whatever's already there plus
+# whatever shows up later (see clip_classifier/watcher.py's watchdog +
+# periodic rescan), so it doesn't need the recorders to be up first, and
+# restarting/redeploying a camera shouldn't restart or block this.
+After=network.target
+
+# Crash-loop protection: if it can't stay up across 5 restarts within 5
+# minutes, stop retrying instead of hammering the disk/CPU forever.
+# `systemctl status clip-classifier` shows "start-limit-hit" when this
+# fires, so it's obvious this happened rather than silently spinning.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=camera-watcher
+Group=camera-watcher
+WorkingDirectory=/opt/camera-watcher
+ExecStart=/opt/camera-watcher/.venv/bin/python -m clip_classifier.main --config /opt/camera-watcher/config/classifier.yaml
+Restart=on-failure
+RestartSec=5
+
+# Hardening -- deliberately conservative given this reads recorded footage
+# and writes analysis sidecars as an always-on background service. Same
+# baseline as camera-watcher@.service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+# If the service fails to start with this on, it's a reasonable first thing
+# to try disabling -- see deploy/README. The CPU (ONNX Runtime) backend in
+# particular may need this off depending on how it JITs.
+MemoryDenyWriteExecute=true
+
+# Unlike camera-watcher@.service, this process never rewrites its own
+# config -- only the shared data_root needs to be writable (it reads
+# clips/metadata under it and writes .analysis.json sidecars next to
+# them). classifier.yaml itself stays read-only, covered by
+# ProtectSystem=strict's default. If using the Hailo backend, /dev/hailo0
+# also needs to be reachable -- see deploy/README.
+ReadWritePaths=/var/lib/camera-watcher
+
+[Install]
+WantedBy=multi-user.target

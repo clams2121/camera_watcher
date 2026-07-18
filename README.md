@@ -293,10 +293,16 @@ Deliberately conservative, the same way the old button used to be:
   individually (not a single fleet-wide command) and prints each one's
   post-restart status, so a restart failure on one camera is visible and
   doesn't hide behind the others succeeding.
+- Also detects `clip-classifier.service` (see below) if it's deployed on
+  this host, installs its extra dependencies from
+  `requirements-classifier.txt` alongside the main ones, and restarts it
+  the same way -- with the same fail-loud rollback-recipe behavior if
+  that dependency install fails.
 - Skips the restart step entirely (with a message, not a failure) on a
-  host with no `systemctl`, or with no `camera-watcher@` instances
-  registered -- `update.sh` also works for `git clone`-only dev checkouts
-  that were never deployed as systemd services.
+  host with no `systemctl`, or with no `camera-watcher@` (or
+  `clip-classifier`) instances registered -- `update.sh` also works for
+  `git clone`-only dev checkouts that were never deployed as systemd
+  services.
 
 `shellcheck update.sh` is clean; see `tests/test_update_sh.py` for
 end-to-end coverage of every path above against real throwaway git repos.
@@ -464,6 +470,13 @@ deleted first once the combined total exceeds `--max-total-gb`, regardless
 of which camera they belong to, so one busy camera can't starve a quiet
 one's clips out of shared disk. (Omit `--global` and point it at one
 camera's own clips directory instead for the single-camera form.)
+
+Add `--dry-run` to see exactly what a real run would do -- every clip that
+would be removed (and, via the log lines above it, why: expired out of its
+tier's window, or deleted under budget pressure) is computed and printed
+with a `[dry-run] would remove:` prefix, without touching the filesystem at
+all. Worth running once after changing any of the flags above, before
+trusting it to a timer.
 
 ### Verdict-aware tiers
 

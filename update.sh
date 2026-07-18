@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Updates this camera_watcher checkout in place and restarts every
-# camera-watcher@ systemd instance on this host -- see the root README's
-# "Updating" section and deploy/README.md.
+# camera-watcher@ systemd instance on this host, plus clip-classifier.service
+# if it's deployed here too -- see the root README's "Updating" section and
+# deploy/README.md.
 #
 # Deliberately conservative, the same way the removed web-UI self-update
 # button used to be:
@@ -122,7 +123,27 @@ EOF
 fi
 log "Dependencies installed."
 
-# --- 4. Restart every camera-watcher@ instance on this host -----------------
+CLASSIFIER_DEPLOYED=0
+if command -v systemctl >/dev/null 2>&1 \
+  && systemctl list-units --all --type=service --plain --no-legend 'clip-classifier.service' 2>/dev/null | grep -q .; then
+  CLASSIFIER_DEPLOYED=1
+  log "clip-classifier.service is deployed on this host -- installing its extra dependencies too..."
+  if ! "$PYTHON" -m pip install -q -r "$REPO_ROOT/requirements-classifier.txt"; then
+    fail "$(cat <<EOF
+clip_classifier dependency install failed -- NOT restarting any service, so the fleet
+keeps running whatever code it was already running. Rollback recipe, if you want the
+checkout back to exactly where it was before this run:
+    git reset --hard $BEFORE_COMMIT
+    $0 --no-fetch
+Otherwise, fix the dependency problem (see the pip output above) and re-run:
+    $0 --no-fetch
+EOF
+)"
+  fi
+  log "clip_classifier dependencies installed."
+fi
+
+# --- 4. Restart every camera-watcher@ instance (and clip-classifier, if deployed) on this host ---
 if ! command -v systemctl >/dev/null 2>&1; then
   log "systemctl not found -- skipping service restart (not a systemd host, or camera_watcher isn't deployed as a service here)."
   log "Update complete."
@@ -130,14 +151,17 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 mapfile -t UNITS < <(systemctl list-units --all --type=service --plain --no-legend 'camera-watcher@*.service' 2>/dev/null | awk '{print $1}')
+if [ "$CLASSIFIER_DEPLOYED" -eq 1 ]; then
+  UNITS+=("clip-classifier.service")
+fi
 
 if [ "${#UNITS[@]}" -eq 0 ]; then
-  log "No camera-watcher@ service instances found on this host -- nothing to restart."
+  log "No camera-watcher@ service instances found on this host (nor clip-classifier) -- nothing to restart."
   log "Update complete."
   exit 0
 fi
 
-log "Restarting ${#UNITS[@]} camera-watcher@ instance(s): ${UNITS[*]}"
+log "Restarting ${#UNITS[@]} service instance(s): ${UNITS[*]}"
 RESTART_FAILURES=0
 for unit in "${UNITS[@]}"; do
   if sudo systemctl restart "$unit"; then

@@ -324,6 +324,88 @@ def test_global_retention_ignores_stray_files_directly_under_clips_root(tmp_path
     assert stray.exists()  # only camera *subdirectories* are swept, not loose files
 
 
+# ---------- --dry-run ----------
+
+
+def test_dry_run_reports_expired_clips_without_deleting_them(tmp_path):
+    clip = tmp_path / "cam_a.mp4"
+    _touch(clip, 10, -40 * 86400)
+    metadata = tmp_path / "cam_a.json"
+    metadata.write_text("{}")
+    _analysis(clip, "low")
+
+    removed = enforce_retention(
+        RetentionConfig(
+            output_dir=tmp_path,
+            low_max_age_hours=1,
+            high_max_age_days=None,
+            review_max_age_days=None,
+            dry_run=True,
+        )
+    )
+    assert removed == [clip]
+    assert clip.exists()  # dry run -- nothing actually deleted
+    assert metadata.exists()
+    assert (tmp_path / "cam_a.analysis.json").exists()
+
+
+def test_dry_run_reports_budget_pressure_deletions_without_deleting_them(tmp_path):
+    low = tmp_path / "cam_low.mp4"
+    high = tmp_path / "cam_high.mp4"
+    _touch(high, 1024 * 1024, -300)
+    _touch(low, 1024 * 1024, -100)
+    _analysis(high, "high")
+    _analysis(low, "low")
+
+    max_gb = 1024 * 1024 / (1024**3)  # forces exactly one removal
+    removed = enforce_retention(
+        RetentionConfig(
+            output_dir=tmp_path,
+            low_max_age_hours=None,
+            high_max_age_days=None,
+            review_max_age_days=None,
+            max_total_gb=max_gb,
+            dry_run=True,
+        )
+    )
+    assert removed == [low]
+    assert low.exists() and high.exists()  # dry run -- nothing actually deleted
+
+
+def test_dry_run_still_logs_review_staleness_and_budget_pressure_warnings(tmp_path, caplog):
+    review = tmp_path / "cam_review.mp4"
+    _touch(review, 10, -40 * 86400)
+    _analysis(review, "review")
+
+    with caplog.at_level(logging.WARNING):
+        removed = enforce_retention(
+            RetentionConfig(
+                output_dir=tmp_path,
+                low_max_age_hours=None,
+                high_max_age_days=None,
+                review_max_age_days=30,
+                dry_run=True,
+            )
+        )
+    assert removed == [review]
+    assert review.exists()
+    assert "never reviewed" in caplog.text
+    assert "Would remove" in caplog.text
+
+
+def test_dry_run_global_retention_deletes_nothing(tmp_path):
+    clips_root = tmp_path / "clips"
+    old = clips_root / "cam1" / "cam1_a.mp4"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    _touch(old, 10, -40 * 86400)
+
+    removed = enforce_global_retention(
+        clips_root, low_max_age_hours=None, high_max_age_days=30, review_max_age_days=None, dry_run=True
+    )
+    assert removed == [old]
+    assert old.exists()
+
+
 def test_global_retention_prioritizes_tier_over_age_for_the_shared_budget(tmp_path, monkeypatch):
     """Proves the fleet-wide budget sweep actually consults classify_tier
     (not just age) -- a newer low-value clip is deleted before an older

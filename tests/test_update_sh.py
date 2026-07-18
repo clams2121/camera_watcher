@@ -3,6 +3,8 @@ than mocking git away -- the whole point of this script is careful git
 plumbing (dirty-tree refusal, fast-forward-only), so faking it out would
 leave the actual behavior untested.
 """
+import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -33,6 +35,7 @@ def _make_origin(tmp_path: Path) -> Path:
     _git(origin, "init", "-q", "-b", "main")
     (origin / "VERSION").write_text("v1\n")
     (origin / "requirements.txt").write_text("# no deps\n")
+    (origin / "requirements-classifier.txt").write_text("-r requirements.txt\n")
     (origin / ".gitignore").write_text(".venv/\n")
     shutil.copy(UPDATE_SH, origin / "update.sh")
     (origin / "update.sh").chmod(0o755)
@@ -46,10 +49,68 @@ def _clone(origin: Path, dest: Path) -> Path:
     return dest
 
 
-def _run_update(clone_dir: Path, *args):
+def _run_update(clone_dir: Path, *args, env=None):
     return subprocess.run(
-        [str(clone_dir / "update.sh"), *args], cwd=clone_dir, capture_output=True, text=True
+        [str(clone_dir / "update.sh"), *args], cwd=clone_dir, capture_output=True, text=True, env=env
     )
+
+
+def _fake_systemctl_and_sudo(clone_dir: Path, camera_units=(), classifier_present=False):
+    """A fake `systemctl` (+ `sudo` that just execs through to it) on PATH,
+    standing in for a real systemd this sandbox doesn't have running (see
+    test_gracefully_reports_no_systemd_units_when_none_are_installed --
+    the real systemctl here always reports zero units, since there's no
+    bus to connect to). Returns (env, restart_log_path) -- restart_log
+    records every `systemctl restart <unit>` call, in order.
+
+    Deliberately written OUTSIDE clone_dir (a real git working tree) --
+    update.sh refuses to run against a dirty tree, and these support files
+    would otherwise show up as untracked changes in it.
+    """
+    bin_dir = clone_dir.parent / f"{clone_dir.name}-fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    restart_log = clone_dir.parent / f"{clone_dir.name}-restart.log"
+
+    camera_lines = "\n".join(f"{u}.service loaded active running" for u in camera_units)
+    classifier_line = "clip-classifier.service loaded active running"
+
+    # Only emit a printf when there's actually something to list -- matching
+    # real systemctl's true behavior of zero lines of output for zero units
+    # (an unconditional printf would emit one blank line even for "none",
+    # which would come out the other end of `mapfile` as one bogus empty
+    # unit name instead of a properly empty array).
+    camera_block = f"printf '%s\\n' {shlex.quote(camera_lines)}" if camera_units else ":"
+    classifier_block = f"printf '%s\\n' {shlex.quote(classifier_line)}" if classifier_present else ":"
+
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        f"""#!/bin/bash
+if [ "$1" = "list-units" ]; then
+  pattern="${{@: -1}}"
+  case "$pattern" in
+    'camera-watcher@*.service') {camera_block} ;;
+    'clip-classifier.service') {classifier_block} ;;
+  esac
+  exit 0
+elif [ "$1" = "restart" ]; then
+  echo "$2" >> {shlex.quote(str(restart_log))}
+  exit 0
+elif [ "$1" = "is-active" ]; then
+  echo "active"
+  exit 0
+fi
+exit 0
+"""
+    )
+    systemctl.chmod(0o755)
+
+    sudo = bin_dir / "sudo"
+    sudo.write_text("#!/bin/sh\nexec \"$@\"\n")
+    sudo.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    return env, restart_log
 
 
 def test_refuses_a_dirty_working_tree(tmp_path):
@@ -189,3 +250,72 @@ def test_gracefully_reports_no_systemd_units_when_none_are_installed(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "No camera-watcher@ service instances found" in result.stdout
+
+
+# ---------- clip-classifier.service detection/restart (fake systemctl+sudo) ----------
+
+
+def test_restarts_camera_units_only_when_no_classifier_is_deployed(tmp_path):
+    origin = _make_origin(tmp_path)
+    clone = _clone(origin, tmp_path / "clone")
+    _fake_python(clone)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=["camera-watcher@front-door"], classifier_present=False)
+
+    result = _run_update(clone, "--no-fetch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "camera-watcher@front-door.service" in result.stdout
+    assert "clip-classifier" not in result.stdout
+    assert restart_log.read_text().splitlines() == ["camera-watcher@front-door.service"]
+
+
+def test_installs_classifier_deps_and_restarts_it_when_deployed(tmp_path):
+    origin = _make_origin(tmp_path)
+    clone = _clone(origin, tmp_path / "clone")
+    _fake_python(clone)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=["camera-watcher@front-door"], classifier_present=True)
+
+    result = _run_update(clone, "--no-fetch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "clip-classifier.service is deployed" in result.stdout
+    assert "clip_classifier dependencies installed" in result.stdout
+    assert set(restart_log.read_text().splitlines()) == {"camera-watcher@front-door.service", "clip-classifier.service"}
+
+
+def test_classifier_alone_with_no_camera_units_still_gets_restarted(tmp_path):
+    origin = _make_origin(tmp_path)
+    clone = _clone(origin, tmp_path / "clone")
+    _fake_python(clone)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=[], classifier_present=True)
+
+    result = _run_update(clone, "--no-fetch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert restart_log.read_text().splitlines() == ["clip-classifier.service"]
+
+
+def test_classifier_dependency_failure_gives_a_rollback_recipe_and_does_not_restart(tmp_path):
+    origin = _make_origin(tmp_path)
+    clone = _clone(origin, tmp_path / "clone")
+    # First pip call (requirements.txt) succeeds, second (requirements-classifier.txt) fails.
+    _fake_python(
+        clone,
+        script=(
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            "  *requirements-classifier.txt*) echo \"classifier pip explosion\" >&2; exit 1 ;;\n"
+            '  *) echo "pip ok"; exit 0 ;;\n'
+            "esac\n"
+        ),
+    )
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=["camera-watcher@front-door"], classifier_present=True)
+    before = _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+    result = _run_update(clone, "--no-fetch", env=env)
+
+    assert result.returncode == 1
+    assert "classifier pip explosion" in result.stderr
+    assert "clip_classifier dependency install failed" in result.stderr
+    assert f"git reset --hard {before}" in result.stderr
+    assert not restart_log.exists()  # nothing was restarted at all
