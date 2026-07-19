@@ -1,16 +1,25 @@
 # camera_watcher
 
-Watches an RTSP camera, detects motion, and saves motion clips (including a
-pre/post buffer) to disk in size-capped chunks with overlap between them. A
-small web UI lets you configure the camera, draw ignore-zones on a snapshot,
-and view a live preview.
+Watches RTSP cameras, detects motion, and saves motion clips (including a
+pre/post buffer) to disk in size-capped chunks with overlap between them.
+
+One always-on process -- the **fleet supervisor** -- runs the whole thing:
+a web UI that's reachable the moment the process starts, regardless of how
+many cameras are configured or how badly any single one of them is broken,
+and that lets you add/edit/remove cameras, their credentials, fleet-wide
+retention, and the optional clip classifier's config, all from the browser.
+There's no hand-editing YAML files or enabling systemd units per camera --
+see "Configuring a camera" below.
 
 This segment only handles capture, motion-triggered recording, and
 retention. Analyzing saved clips for people/other activity is a later stage
-of the larger project.
+of the larger project (see "Clip classifier (tier 1)" below).
 
 ## How it works
 
+Everything below describes one camera's own capture/recording pipeline --
+one instance of `CameraPipeline` runs per configured camera, all owned and
+supervised inside the single fleet process (see `camera_watcher/fleet.py`).
 Each camera is read via **two independent RTSP connections**:
 
 - **Main stream** (`camera.main_path`, full resolution): never decoded.
@@ -40,7 +49,9 @@ A separate pruning sweep keeps the segment cache trimmed to roughly
 `pre_buffer_seconds` of lookback, and never deletes a segment that's part of
 an open event's window or an assembly job that hasn't finished yet.
 
-Retention runs externally, outside this process entirely -- see "Retention"
+Retention is not part of any one camera's pipeline -- it's a single,
+fleet-wide background thread in the supervisor process, sweeping every
+camera's clips together against one shared budget -- see "Retention"
 below. A never-decaying motion heatmap plus each clip's own metadata JSON
 (`bounding_box`, among other fields) help spot zones that need a new or
 larger ignore zone -- see "Tuning ignore zones" below.
@@ -60,31 +71,40 @@ rate (e.g. `15` at 15fps).
 
 ## Threading model
 
-Every stage runs on its own thread so a slow one can never stall another,
-and the web UI stays responsive no matter what the camera is doing:
+One process, many threads -- every camera's pipeline, plus retention, plus
+the web UI, all run inside the single fleet supervisor. Every stage runs on
+its own thread so a slow one can never stall another, and the web UI stays
+responsive no matter what any camera is doing:
 
-- **Sub-stream capture thread** only reads frames off the RTSP socket and
-  appends them to the shared frame buffer (live preview/snapshot source) --
-  it never touches disk.
-- **Passthrough recorder** (`segment_cache.py`): a supervised ffmpeg
-  subprocess stream-copying the main stream into cached segments, with its
-  own restart-with-backoff and stall detection (no new segment for too long
-  while the process is still alive kills and restarts it).
-- **Processing thread** pulls sub-stream frames off a bounded queue and does
-  the motion detection work, decoupled from capture so a slow frame never
-  backs up RTSP reads. If processing falls behind, the queue sheds (drops)
-  the oldest-pending frames rather than growing without bound or blocking
-  capture; `/api/status` reports `dropped_frames` if this happens.
-- **Clip assembler thread**: motion-triggered ffmpeg concat calls run here,
-  never on the frame-processing thread, so assembling a clip can never stall
-  live motion detection.
-- **Cache pruner** and **heatmap persistence** each run on their own timer
-  thread. Retention is not one of this process's threads at all -- it's a
-  separate, standalone process (see "Retention" below).
-- **Web UI** (Flask) runs on the main thread with a threaded WSGI server, and
-  only ever touches the shared, thread-safe frame buffer and config -- never
-  the camera connection directly -- so `GET /` and the API always respond
-  immediately even while disconnected, reconnecting, or mid-recording.
+- **Sub-stream capture thread** (one per camera) only reads frames off the
+  RTSP socket and appends them to that camera's shared frame buffer (live
+  preview/snapshot source) -- it never touches disk.
+- **Passthrough recorder** (`segment_cache.py`, one per camera): a
+  supervised ffmpeg subprocess stream-copying the main stream into cached
+  segments, with its own restart-with-backoff and stall detection (no new
+  segment for too long while the process is still alive kills and restarts
+  it).
+- **Processing thread** (one per camera) pulls sub-stream frames off a
+  bounded queue and does the motion detection work, decoupled from capture
+  so a slow frame never backs up RTSP reads. If processing falls behind,
+  the queue sheds (drops) the oldest-pending frames rather than growing
+  without bound or blocking capture; a camera's `status` reports
+  `dropped_frames` if this happens.
+- **Clip assembler thread** (one per camera): motion-triggered ffmpeg
+  concat calls run here, never on the frame-processing thread, so
+  assembling a clip can never stall live motion detection.
+- **Cache pruner** and **heatmap persistence** (one pair per camera) each
+  run on their own timer thread.
+- **Retention scheduler**: exactly one, fleet-wide background thread (not
+  per camera), sweeping every camera's clips together on a schedule -- see
+  "Retention" below.
+- **Web UI** (Flask) runs on the main thread with a threaded WSGI server,
+  and only ever touches each camera's shared, thread-safe frame buffer and
+  config -- never a camera connection directly -- so the UI keeps
+  responding immediately for every route, and every other camera, even
+  while one camera is disconnected, reconnecting, mid-recording, or failed
+  to start at all (see "Configuring a camera" below for what that last one
+  looks like from the UI).
 
 ## Install
 
@@ -138,67 +158,43 @@ pip install -r requirements.txt          # add -dev.txt too if running tests
 
 ### Configuring a camera
 
-Each camera gets its own config file, name of your choosing (letters,
-digits, `_` and `-` only -- it ends up in clip filenames):
+Start the fleet supervisor, pointed at a config directory (created
+automatically if it doesn't exist yet -- nothing needs to exist beforehand):
 
 ```bash
-cp config/camera.example.yaml config/front-door.yaml
-cp config/camera.secrets.example.yaml config/front-door.secrets.yaml
-# edit both: at minimum camera.name/host in front-door.yaml, and
-# camera.username/password + web.auth_token in front-door.secrets.yaml
+python -m camera_watcher.main --config-dir config
 ```
 
-`--config` is required and must point at a real file -- nothing is
-auto-created for you here. If you point it at a path that doesn't exist,
-the app fails immediately with the exact `cp` command above rather than
-silently starting some default camera you didn't mean to configure. Startup
-also fails loud if `web.auth_token` is missing/too short (see
-Authentication below) or if `web.host` is the default `"tailscale"` and
-this machine isn't on a Tailscale network.
+The first run prints a generated auth token once (also saved to
+`config/fleet.secrets.yaml`) -- see Authentication below. Open
+`http://<tailscale-ip>:8080` (see "Network binding: Tailscale only" below
+for how to find that address, or whatever `web.port` you've set in Fleet
+Settings), log in with that token, and use the **Add Camera** tab: name
+(letters, digits, `_` and `-` only -- it ends up in clip filenames), host,
+port, stream paths, transport, and credentials. Saving starts that
+camera's capture/recording pipeline immediately -- there's no separate
+"apply" or restart step, and no config file to hand-edit or `cp` first.
 
-Run it:
+That's the whole workflow for every camera from here on: **Cameras** tab
+to see the fleet (status badge per camera, click through to a camera's own
+page), each camera's own page for its Settings/Ignore Mask/Live
+Preview/Recordings tabs (same four tabs this project has always had, just
+now reached via `/cameras/<name>` instead of its own port) plus a Remove
+button, and **Fleet Settings** for the web bind and retention. See
+"Authentication" and "Retention" below for those two tabs' own sections.
 
-```bash
-python -m camera_watcher.main --config config/front-door.yaml
-```
+**A camera that fails to start (bad host, wrong credentials, whatever)
+never takes anything else down with it.** Its status badge shows `error`
+with the reason, right there in the Cameras list and at the top of its own
+Settings tab -- fix the settings and save, and it retries immediately. The
+UI itself, and every other camera, stay completely unaffected the whole
+time; there's no scenario where a single misconfigured camera means you
+need shell access to fix anything.
 
-**Every relative path inside `front-door.yaml`** (`data_root`,
-`secrets_path`, `mask.path`, `recording.output_dir`, `recording.cache_dir`,
-`motion.heatmap_path`) resolves against the directory `front-door.yaml`
-itself lives in -- **never** against whatever directory you happen to run
-the command from. This is what makes it safe to run several camera
-processes from systemd, cron, or any working directory. Absolute paths
-work too and pass through unchanged.
-
-By default, `secrets_path` derives to `front-door.secrets.yaml` and
-`mask.path` to `front-door.mask.json`, both next to the config file;
-`recording.output_dir` derives to `<data_root>/clips/front-door`
-(`data_root` itself defaults to a `data/` directory next to the config
-file). Override any of these explicitly in the YAML if you want them
-somewhere else -- e.g. point several cameras' `data_root` at the same
-shared path so retention can sweep the whole fleet's clips from one place
-(see Retention below).
-
-Each camera needs its own `web.port` -- if two configs on the same host
-try to use the same port, the second process fails loud at startup
-("Cannot bind ... Address already in use") instead of silently stealing
-the port or failing somewhere more confusing later.
-
-Then open `http://<tailscale-ip>:8080` (see "Network binding: Tailscale
-only" below for how to find that address, or whatever `web.port` you set)
-for the web UI (Settings / Ignore Mask / Live Preview / Recordings tabs) --
-from any device on the same tailnet. You'll land on a login page first; see
-Authentication below. If it doesn't load, see Troubleshooting below.
-
-To add a second camera, repeat the `cp` steps above with a new name and a
-different `web.port`, then run a second `python -m camera_watcher.main
---config config/<name>.yaml` process.
-
-Running more than a couple of cameras by hand like this gets tedious fast --
-see `deploy/README.md` for running the whole fleet as systemd services
-(one `camera-watcher@<name>.service` instance per camera, restart-on-failure,
-sandboxing/hardening, plus the fleet-wide retention timer from "Retention"
-below).
+Every camera shares one `data_root` (clips, cache, heatmaps) -- set once,
+fleet-wide, in `config/fleet.yaml` -- so retention (see below) always
+sweeps everyone's clips from one place without any camera needing to agree
+on a path individually.
 
 The Recordings tab groups clips into 30-minute buckets aligned to :00/:30
 (newest group first); clicking a clip streams it in the browser with
@@ -209,45 +205,72 @@ for confirmation first. Neither waits on retention. The Ignore Mask tab
 lists drawn shapes alongside the canvas -- click one to highlight it, then
 "Delete selected shape" to remove just that one.
 
-The header's "Stop Server" button asks you to type `quit` to confirm, then
-cleanly shuts the whole process down (capture, recording, the heatmap
-accumulator all stop/flush the same way as Ctrl+C does in the terminal).
-If you're running this under something that auto-restarts
-crashed/exited processes (a systemd unit with `Restart=always`, `docker run
---restart unless-stopped`, etc.), it'll just come back up -- stop it at that
-supervisor level too if you actually want it to stay down.
+The header's "Stop Server" button (on the fleet dashboard) asks you to type
+`quit` to confirm, then cleanly shuts the whole process down -- every
+camera's capture/recording, the heatmap accumulators, and the retention
+scheduler all stop/flush the same way as Ctrl+C does in the terminal. Under
+systemd with `Restart=always` (the default in `deploy/camera-watcher.service`),
+it comes right back up -- which is also how a saved `web.host`/`web.port`/
+auth-token change actually takes effect; see Authentication and Fleet
+Settings below.
+
+Configuring more than a couple of cameras is exactly the same UI flow
+regardless of count -- see `deploy/README.md` for running the supervisor
+as a single systemd service (`camera-watcher.service`, restart-on-failure,
+sandboxing/hardening) instead of a foreground process.
 
 ## Network binding: Tailscale only
 
-`web.host` defaults to `"tailscale"`, which resolves this host's Tailscale
-IPv4 address (`tailscale ip -4`) at startup and binds the web server only
-there -- never `0.0.0.0`, never a LAN/public interface. If Tailscale isn't
-installed, isn't logged in, or returns something that doesn't look like a
-Tailscale address (`100.64.0.0/10`), startup fails loud with a plain-English
-message instead of silently binding somewhere broader. Set `web.host` to an
-explicit literal address (e.g. `127.0.0.1` for local testing) to bypass
-Tailscale entirely.
+`web.host` (Fleet Settings tab, or `config/fleet.yaml`) defaults to
+`"tailscale"`, which resolves this host's Tailscale IPv4 address
+(`tailscale ip -4`) at startup and binds the **one, fleet-wide** web server
+only there -- never `0.0.0.0`, never a LAN/public interface. If Tailscale
+isn't installed, isn't logged in, or returns something that doesn't look
+like a Tailscale address (`100.64.0.0/10`), startup fails loud with a
+plain-English message instead of silently binding somewhere broader --
+this is the one thing in the whole fleet still allowed to stop the process
+at startup (no individual camera's problems ever can; see "Configuring a
+camera" above). Set `web.host` to an explicit literal address (e.g.
+`127.0.0.1` for local testing) to bypass Tailscale entirely. Changing
+either `web.host` or `web.port` from Fleet Settings takes effect on the
+**next restart**, not immediately -- the UI says so right there, and "Stop
+Server" (under `Restart=always`) is the button that applies it.
 
 Served by [waitress](https://docs.pylonsproject.org/projects/waitress/), a
 production-grade WSGI server -- not Flask's own development server.
 
 ## Authentication
 
-Every camera process requires its own auth token, generated once and stored
-in that camera's `<name>.secrets.yaml`:
+The fleet supervisor has exactly one auth token for its one web UI, in
+`config/fleet.secrets.yaml`. Unlike per-camera secrets, **you don't
+generate or set this yourself** -- the first time the process runs with
+none configured, it generates one automatically and prints it once:
 
-```bash
-python -c "from camera_watcher.auth import generate_token; print(generate_token())"
+```
+======================================================================
+No auth token was configured -- generated a new one.
+Log in to the web UI with this token (also saved in .../fleet.secrets.yaml):
+
+    <the token>
+
+Change it any time from Fleet Settings once logged in.
+======================================================================
 ```
 
-```yaml
-# <name>.secrets.yaml
-web:
-  auth_token: "<paste the generated token here>"
-```
+This is what makes "the UI should always run" actually true from a cold
+start -- there's no manual token-generation step blocking your first
+login. Change it any time from the **Fleet Settings** tab's "Rotate auth
+token" button, which generates and saves a new one immediately and shows
+it to you exactly once (also only in `fleet.secrets.yaml` after that) --
+note that the *running* process keeps accepting the old token until it
+restarts, so your current session and any scripts using the old token
+keep working until then; the UI says this explicitly next to the button.
 
-There's no way to disable this -- a missing or too-short (< 32 character)
-token fails startup loud, the same way a missing `camera.name` does.
+A present-but-too-short (< 32 character) token -- only possible via a
+hand-edited `fleet.secrets.yaml`, since the bootstrap never generates a
+weak one -- still fails startup loud, the same way a missing
+`camera.name` does; auto-generation is a fail-*safe*, not a policy that
+silently waves away a genuinely broken config.
 
 - **Browser**: visiting any page without a valid session redirects to
   `/login`, a minimal token-entry form. `POST /api/login` compares the
@@ -270,8 +293,8 @@ the UI could make it pull and run arbitrary upstream code). Updates are now
 an operator-run script, `update.sh`, at the repo root:
 
 ```bash
-./update.sh              # fetch, fast-forward, reinstall deps, restart every
-                          # camera-watcher@ systemd instance on this host
+./update.sh              # fetch, fast-forward, reinstall deps, restart
+                          # camera-watcher.service on this host
 ./update.sh --no-fetch    # skip fetch/merge -- just reinstall deps and restart
                           # (e.g. after updating the code some other way)
 ```
@@ -284,23 +307,21 @@ Deliberately conservative, the same way the old button used to be:
   creates a merge commit or discards local history. If the branch has
   diverged from upstream, it stops without touching anything and prints the
   exact `git log` commands to look into why.
-- **Only restarts services after `pip install -r requirements.txt`
+- **Only restarts the service after `pip install -r requirements.txt`
   succeeds.** A failed dependency install leaves whatever was already
   running under systemd alone, and prints a rollback recipe
   (`git reset --hard <commit-before-this-run>`) rather than leaving the
   fleet mid-update.
-- Restarts every `camera-watcher@*` instance found on the host
-  individually (not a single fleet-wide command) and prints each one's
-  post-restart status, so a restart failure on one camera is visible and
-  doesn't hide behind the others succeeding.
+- Restarts `camera-watcher.service` -- one supervisor for every camera --
+  and prints its post-restart status.
 - Also detects `clip-classifier.service` (see below) if it's deployed on
   this host, installs its extra dependencies from
   `requirements-classifier.txt` alongside the main ones, and restarts it
   the same way -- with the same fail-loud rollback-recipe behavior if
   that dependency install fails.
 - Skips the restart step entirely (with a message, not a failure) on a
-  host with no `systemctl`, or with no `camera-watcher@` (or
-  `clip-classifier`) instances registered -- `update.sh` also works for
+  host with no `systemctl`, or with no `camera-watcher.service` (or
+  `clip-classifier`) registered -- `update.sh` also works for
   `git clone`-only dev checkouts that were never deployed as systemd
   services.
 
@@ -391,7 +412,7 @@ all remove both together):
 - **peak_motion_time**: ISO 8601 timestamp of the single highest-scoring frame, or `null` if there was none.
 - **motion_timeline**: one entry per whole second of the event (not per-frame -- that could be thousands of entries for a long event), each with that second's peak score and whether any motion was detected in it.
 - **sub_fps_measured**: the sub-stream's actual observed frame rate during this event -- a diagnostic, not a recording parameter (recording never uses an fps hint at all; it's pure stream-copy).
-- **config_hash** / **mask_hash**: short hashes of the camera's settings/ignore-mask exactly as they were when this event's window opened -- lets you correlate "which config produced this clip" across a fleet, or spot that a clip landed right after a config change, without ever hashing credentials (`config_hash` is computed from `config/<name>.yaml` only, never `.secrets.yaml`).
+- **config_hash** / **mask_hash**: short hashes of the camera's settings/ignore-mask exactly as they were when this event's window opened -- lets you correlate "which config produced this clip" across a fleet, or spot that a clip landed right after a config change, without ever hashing credentials (`config_hash` is computed from `config/cameras/<name>.yaml` only, never `.secrets.yaml`).
 
 ### Rebuilding the clip index
 
@@ -415,53 +436,78 @@ third-party dependencies at all and can run standalone with just Python 3.
 
 ## Credentials -- please read
 
-Camera credentials **and** the web UI's auth token are **never** stored in
-`config/<name>.yaml` and always go in `config/<name>.secrets.yaml` instead
-(see `secrets_path` above if you want it named/located differently), kept
-as a separate file so the two can't accidentally get mixed up. Both are
-gitignored (see "Local config, not checked into git" below) -- neither is
-ever meant to be committed. Only the generic
-`config/camera.secrets.example.yaml` (with blank values) is tracked in git.
-The web UI's password field never echoes back the stored password -- it
-always displays blank, and leaving it blank on save keeps the existing
-value.
+Camera credentials go in `config/cameras/<name>.secrets.yaml`, one per
+camera, kept separate from that camera's own `config/cameras/<name>.yaml`
+settings file so the two can't accidentally get mixed up; the fleet web
+UI's own auth token lives in `config/fleet.secrets.yaml` the same way,
+separate from `config/fleet.yaml`. All four are written entirely by the
+app itself (the Add Camera / Settings / Fleet Settings forms, and the
+auth-token bootstrap/rotation) -- see "Configuring a camera" and
+"Authentication" above; there's no manual file to create or edit for
+normal use. They're all gitignored (see "Local config, not checked into
+git" below) -- none of them are ever meant to be committed. The web UI's
+password field never echoes back a stored password -- it always displays
+blank, and leaving it blank on save keeps the existing value.
 
-Before committing, double check `git status` doesn't show any
-`config/<name>.yaml`, `config/<name>.secrets.yaml`, `config/<name>.mask.json`,
-or anything under `data/`.
+Before committing, double check `git status` doesn't show anything under
+`config/cameras/`, `config/fleet.yaml`, `config/fleet.secrets.yaml`,
+`config/classifier.yaml`, or `data/`.
 
 ## Local config, not checked into git
 
-Everything this app writes to disk on its own -- each camera's
-`config/<name>.yaml`, `config/<name>.secrets.yaml`, `config/<name>.mask.json`,
-its motion heatmap, and recorded clips (with their metadata sidecars) under
-`data/` -- is gitignored. Only checked-in *templates* live in git:
+Everything this app writes to disk on its own -- `config/fleet.yaml`,
+`config/fleet.secrets.yaml`, `config/classifier.yaml`, every camera's
+`config/cameras/<name>.yaml` / `<name>.secrets.yaml` / `<name>.mask.json`,
+each camera's motion heatmap, and recorded clips (with their metadata
+sidecars) under the shared `data_root` -- is gitignored. Only checked-in
+*reference templates* live in git, useful for seeing the full shape of a
+config file or for scripting/manual setups that bypass the UI on purpose:
 
-| Tracked template (safe to commit) | Local file it produces (gitignored) |
+| Tracked template (safe to commit) | What actually gets used at runtime |
 | --- | --- |
-| `config/camera.example.yaml` | `config/<name>.yaml` -- copy and edit by hand (`--config` requires it to already exist; nothing is auto-created for you, on purpose -- see Setup above) |
-| `config/camera.secrets.example.yaml` | `config/<name>.secrets.yaml` -- copy it yourself and fill in real credentials; there's no safe default to seed it with |
-| `config/camera.mask.example.json` | `config/<name>.mask.json` -- *not* auto-copied either (its sample polygon is just a format example, not a sensible default for your camera); starts with no ignore zones and is created once you draw and save your first shape |
+| `config/camera.example.yaml` | `config/cameras/<name>.yaml` -- created by the Add Camera form; edited by each camera's own Settings tab |
+| `config/camera.secrets.example.yaml` | `config/cameras/<name>.secrets.yaml` -- same forms, credentials fields |
+| `config/classifier.example.yaml` | `config/classifier.yaml` -- created/edited by the fleet UI's Classifier tab |
+
+Nothing under `config/cameras/<name>.mask.json` has a template at all -- a
+camera starts with no ignore zones, and the file is created the first time
+you draw and save a shape on that camera's Ignore Mask tab.
 
 ## Configuration reference
 
-See `config/camera.example.yaml` for the full set of options with inline
-comments, covering camera connection, motion sensitivity, recording
-buffer/chunk/overlap timing, and the web server -- your actual
-`config/<name>.yaml` starts as a copy of it and has the same shape.
-Retention is configured separately, fleet-wide -- see "Retention" below.
+See `config/camera.example.yaml` for the full set of per-camera options
+with inline comments (camera connection, motion sensitivity, recording
+buffer/chunk/overlap timing); `config/classifier.example.yaml` for the
+clip classifier's. Fleet-wide settings (web bind, retention) don't have a
+separate template file to read -- `config/fleet.yaml` is created with
+sensible defaults on first boot and every field is editable from the
+Fleet Settings tab; see "Retention" below for what each of its fields
+does.
 
 ## Retention
 
-Retention is **not** configured per camera and does **not** run inside the
-camera process at all -- it's a standalone CLI
-(`camera_watcher/retention.py`, no third-party dependencies) meant to be
-invoked on a schedule against a whole fleet's shared `data_root`:
+Retention is fleet-wide, not per camera, and runs as a single background
+thread **inside the fleet supervisor process itself** -- see
+`RetentionScheduler` in `camera_watcher/retention.py` -- sweeping every
+camera's clips under the shared `data_root` on a schedule. There's no
+separate timer process to deploy or configure.
+
+Everything's editable live from the **Fleet Settings** tab: low/high/review
+age windows, the shared size budget, and how often the sweep runs
+(`interval_minutes`, default 60) -- saved changes apply on the *next*
+sweep, no restart needed. The same tab has "Preview (dry run)" and "Run
+now" buttons that call the same sweep on demand and show exactly what it
+did (or would do) right there -- worth using once after changing any
+setting, before trusting it to the schedule.
+
+The same sweep logic is also still available as a standalone CLI, useful
+for one-off/diagnostic runs against a clips directory copied elsewhere
+(it has no third-party dependencies and runs with just Python 3):
 
 ```bash
 python -m camera_watcher.retention --global <data_root>/clips \
     --low-max-age-hours 48 --high-max-age-days 30 --review-max-age-days 30 \
-    --max-total-gb 500
+    --max-total-gb 500 --dry-run
 ```
 
 `--global` sweeps every camera's subdirectory under `<data_root>/clips/`
@@ -469,14 +515,12 @@ against **one shared budget** -- the globally oldest, lowest-tier clips are
 deleted first once the combined total exceeds `--max-total-gb`, regardless
 of which camera they belong to, so one busy camera can't starve a quiet
 one's clips out of shared disk. (Omit `--global` and point it at one
-camera's own clips directory instead for the single-camera form.)
-
-Add `--dry-run` to see exactly what a real run would do -- every clip that
+camera's own clips directory instead for the single-camera form.) Add
+`--dry-run` to see exactly what a real run would do -- every clip that
 would be removed (and, via the log lines above it, why: expired out of its
 tier's window, or deleted under budget pressure) is computed and printed
 with a `[dry-run] would remove:` prefix, without touching the filesystem at
-all. Worth running once after changing any of the flags above, before
-trusting it to a timer.
+all.
 
 ### Verdict-aware tiers
 
@@ -485,11 +529,11 @@ retention reads its `<stem>.analysis.json` verdict -- and, for `review`
 clips, any `<stem>.review.json` human decision -- to sort each clip into
 one of three tiers via `classify_tier()`, each with its own age window:
 
-| Tier | Which clips | Default window | Flag |
+| Tier | Which clips | Default window | Fleet Settings field / CLI flag |
 | --- | --- | --- | --- |
-| `low` | verdict `low` | 48 hours | `--low-max-age-hours` |
-| `high` | verdict `high`, verdict `error`, no analysis sidecar yet (not-yet-classified), or verdict `review` with a `review.json` decision of `keep` | 30 days | `--high-max-age-days` |
-| `review` | verdict `review`, never reviewed | 30 days | `--review-max-age-days` |
+| `low` | verdict `low` | 48 hours | Low-tier max age / `--low-max-age-hours` |
+| `high` | verdict `high`, verdict `error`, no analysis sidecar yet (not-yet-classified), or verdict `review` with a `review.json` decision of `keep` | 30 days | High-tier max age / `--high-max-age-days` |
+| `review` | verdict `review`, never reviewed | 30 days | Review-tier max age / `--review-max-age-days` |
 
 A clip clip_classifier hasn't reached yet (or choked on, `verdict:
 "error"`) is deliberately treated as `high`, not deleted early -- nothing
@@ -514,7 +558,8 @@ Either phase, once a clip is actually deleted, removes its whole sidecar
 family together: the recorder's `<stem>.json`, clip_classifier's
 `<stem>.analysis.json`, and any `<stem>.review.json`.
 
-See `deploy/` for the systemd timer that runs this automatically.
+See `deploy/` for `camera-watcher.service`, the one systemd unit that runs
+this automatically as part of the fleet supervisor -- no separate timer.
 
 ## Troubleshooting: can't reach the web UI from another device
 
@@ -540,9 +585,11 @@ these in order:
    tailscale0 to any port 8080` on Ubuntu). This is the most common blocker
    and won't show up in the app's own logs at all -- the connection just
    times out.
-5. **Set `web.host` explicitly** if you deliberately want something other
-   than Tailscale (e.g. `127.0.0.1` for local-machine-only testing) --
-   see "Network binding: Tailscale only" above.
+5. **Set `web.host` explicitly** (Fleet Settings tab, or `config/fleet.yaml`
+   directly if you can't reach the UI yet) if you deliberately want
+   something other than Tailscale (e.g. `127.0.0.1` for local-machine-only
+   testing) -- see "Network binding: Tailscale only" above. Remember this
+   needs a restart to take effect.
 
 ## Clip classifier (tier 1)
 
@@ -555,9 +602,15 @@ ever adds files of its own.
 
 ```bash
 pip install -r requirements-classifier.txt
-cp config/classifier.example.yaml config/classifier.yaml
-# edit it: at minimum data_root, pointed at the same data_root your
-# camera_watcher fleet shares
+```
+
+Then save at least a backend choice from the fleet web UI's **Classifier**
+tab -- this creates `config/classifier.yaml` for you, with `data_root`
+already pointed at the same shared root every camera writes clips into
+(see `config/classifier.example.yaml` for the full set of options if
+you'd rather create/edit the file by hand instead). Then run it:
+
+```bash
 python -m clip_classifier.main --config config/classifier.yaml
 ```
 

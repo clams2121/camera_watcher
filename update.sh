@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Updates this camera_watcher checkout in place and restarts every
-# camera-watcher@ systemd instance on this host, plus clip-classifier.service
-# if it's deployed here too -- see the root README's "Updating" section and
+# Updates this camera_watcher checkout in place and restarts
+# camera-watcher.service on this host, plus clip-classifier.service if
+# it's deployed here too -- see the root README's "Updating" section and
 # deploy/README.md.
 #
 # Deliberately conservative, the same way the removed web-UI self-update
@@ -143,20 +143,23 @@ EOF
   log "clip_classifier dependencies installed."
 fi
 
-# --- 4. Restart every camera-watcher@ instance (and clip-classifier, if deployed) on this host ---
+# --- 4. Restart camera-watcher.service (and clip-classifier, if deployed) on this host ---
 if ! command -v systemctl >/dev/null 2>&1; then
   log "systemctl not found -- skipping service restart (not a systemd host, or camera_watcher isn't deployed as a service here)."
   log "Update complete."
   exit 0
 fi
 
-mapfile -t UNITS < <(systemctl list-units --all --type=service --plain --no-legend 'camera-watcher@*.service' 2>/dev/null | awk '{print $1}')
+UNITS=()
+if systemctl list-units --all --type=service --plain --no-legend 'camera-watcher.service' 2>/dev/null | grep -q .; then
+  UNITS+=("camera-watcher.service")
+fi
 if [ "$CLASSIFIER_DEPLOYED" -eq 1 ]; then
   UNITS+=("clip-classifier.service")
 fi
 
 if [ "${#UNITS[@]}" -eq 0 ]; then
-  log "No camera-watcher@ service instances found on this host (nor clip-classifier) -- nothing to restart."
+  log "No camera-watcher.service found on this host (nor clip-classifier) -- nothing to restart."
   log "Update complete."
   exit 0
 fi

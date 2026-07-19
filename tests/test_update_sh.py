@@ -55,7 +55,7 @@ def _run_update(clone_dir: Path, *args, env=None):
     )
 
 
-def _fake_systemctl_and_sudo(clone_dir: Path, camera_units=(), classifier_present=False):
+def _fake_systemctl_and_sudo(clone_dir: Path, camera_watcher_deployed=False, classifier_present=False):
     """A fake `systemctl` (+ `sudo` that just execs through to it) on PATH,
     standing in for a real systemd this sandbox doesn't have running (see
     test_gracefully_reports_no_systemd_units_when_none_are_installed --
@@ -71,15 +71,15 @@ def _fake_systemctl_and_sudo(clone_dir: Path, camera_units=(), classifier_presen
     bin_dir.mkdir(exist_ok=True)
     restart_log = clone_dir.parent / f"{clone_dir.name}-restart.log"
 
-    camera_lines = "\n".join(f"{u}.service loaded active running" for u in camera_units)
+    camera_line = "camera-watcher.service loaded active running"
     classifier_line = "clip-classifier.service loaded active running"
 
     # Only emit a printf when there's actually something to list -- matching
     # real systemctl's true behavior of zero lines of output for zero units
     # (an unconditional printf would emit one blank line even for "none",
-    # which would come out the other end of `mapfile` as one bogus empty
-    # unit name instead of a properly empty array).
-    camera_block = f"printf '%s\\n' {shlex.quote(camera_lines)}" if camera_units else ":"
+    # which the `grep -q .` check in update.sh must correctly treat as
+    # "not deployed" rather than a false match).
+    camera_block = f"printf '%s\\n' {shlex.quote(camera_line)}" if camera_watcher_deployed else ":"
     classifier_block = f"printf '%s\\n' {shlex.quote(classifier_line)}" if classifier_present else ":"
 
     systemctl = bin_dir / "systemctl"
@@ -88,7 +88,7 @@ def _fake_systemctl_and_sudo(clone_dir: Path, camera_units=(), classifier_presen
 if [ "$1" = "list-units" ]; then
   pattern="${{@: -1}}"
   case "$pattern" in
-    'camera-watcher@*.service') {camera_block} ;;
+    'camera-watcher.service') {camera_block} ;;
     'clip-classifier.service') {classifier_block} ;;
   esac
   exit 0
@@ -236,9 +236,9 @@ def test_fails_loud_in_detached_head_state(tmp_path):
 
 
 def test_gracefully_reports_no_systemd_units_when_none_are_installed(tmp_path):
-    # This sandbox does have a real `systemctl`, but no camera-watcher@
-    # instances registered -- exercises the real (not mocked) systemctl
-    # list-units call finding nothing, rather than assuming it's absent.
+    # This sandbox does have a real `systemctl`, but no camera-watcher.service
+    # registered -- exercises the real (not mocked) systemctl list-units
+    # call finding nothing, rather than assuming it's absent.
     if shutil.which("systemctl") is None:
         pytest.skip("systemctl not available in this environment")
 
@@ -249,45 +249,45 @@ def test_gracefully_reports_no_systemd_units_when_none_are_installed(tmp_path):
     result = _run_update(clone, "--no-fetch")
 
     assert result.returncode == 0, result.stderr
-    assert "No camera-watcher@ service instances found" in result.stdout
+    assert "No camera-watcher.service found" in result.stdout
 
 
-# ---------- clip-classifier.service detection/restart (fake systemctl+sudo) ----------
+# ---------- camera-watcher.service / clip-classifier.service detection+restart (fake systemctl+sudo) ----------
 
 
-def test_restarts_camera_units_only_when_no_classifier_is_deployed(tmp_path):
+def test_restarts_camera_watcher_only_when_no_classifier_is_deployed(tmp_path):
     origin = _make_origin(tmp_path)
     clone = _clone(origin, tmp_path / "clone")
     _fake_python(clone)
-    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=["camera-watcher@front-door"], classifier_present=False)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_watcher_deployed=True, classifier_present=False)
 
     result = _run_update(clone, "--no-fetch", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "camera-watcher@front-door.service" in result.stdout
+    assert "camera-watcher.service" in result.stdout
     assert "clip-classifier" not in result.stdout
-    assert restart_log.read_text().splitlines() == ["camera-watcher@front-door.service"]
+    assert restart_log.read_text().splitlines() == ["camera-watcher.service"]
 
 
 def test_installs_classifier_deps_and_restarts_it_when_deployed(tmp_path):
     origin = _make_origin(tmp_path)
     clone = _clone(origin, tmp_path / "clone")
     _fake_python(clone)
-    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=["camera-watcher@front-door"], classifier_present=True)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_watcher_deployed=True, classifier_present=True)
 
     result = _run_update(clone, "--no-fetch", env=env)
 
     assert result.returncode == 0, result.stderr
     assert "clip-classifier.service is deployed" in result.stdout
     assert "clip_classifier dependencies installed" in result.stdout
-    assert set(restart_log.read_text().splitlines()) == {"camera-watcher@front-door.service", "clip-classifier.service"}
+    assert set(restart_log.read_text().splitlines()) == {"camera-watcher.service", "clip-classifier.service"}
 
 
-def test_classifier_alone_with_no_camera_units_still_gets_restarted(tmp_path):
+def test_classifier_alone_with_no_camera_watcher_still_gets_restarted(tmp_path):
     origin = _make_origin(tmp_path)
     clone = _clone(origin, tmp_path / "clone")
     _fake_python(clone)
-    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=[], classifier_present=True)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_watcher_deployed=False, classifier_present=True)
 
     result = _run_update(clone, "--no-fetch", env=env)
 
@@ -309,7 +309,7 @@ def test_classifier_dependency_failure_gives_a_rollback_recipe_and_does_not_rest
             "esac\n"
         ),
     )
-    env, restart_log = _fake_systemctl_and_sudo(clone, camera_units=["camera-watcher@front-door"], classifier_present=True)
+    env, restart_log = _fake_systemctl_and_sudo(clone, camera_watcher_deployed=True, classifier_present=True)
     before = _git(clone, "rev-parse", "HEAD").stdout.strip()
 
     result = _run_update(clone, "--no-fetch", env=env)

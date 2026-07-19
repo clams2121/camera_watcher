@@ -2,11 +2,11 @@
 Description=camera_watcher clip classifier (tier 1)
 Documentation=https://github.com/clams2121/camera_watcher
 
-# Deliberately no After=/Wants= on any camera-watcher@*.service: this
-# watches data_root's clips directories for whatever's already there plus
-# whatever shows up later (see clip_classifier/watcher.py's watchdog +
-# periodic rescan), so it doesn't need the recorders to be up first, and
-# restarting/redeploying a camera shouldn't restart or block this.
+# Deliberately no After=/Wants= on camera-watcher.service: this watches
+# data_root's clips directories for whatever's already there plus whatever
+# shows up later (see clip_classifier/watcher.py's watchdog + periodic
+# rescan), so it doesn't need the fleet supervisor up first, and
+# restarting/redeploying it shouldn't restart or block this (or vice versa).
 After=network.target
 
 # Crash-loop protection: if it can't stay up across 5 restarts within 5
@@ -27,7 +27,7 @@ RestartSec=5
 
 # Hardening -- deliberately conservative given this reads recorded footage
 # and writes analysis sidecars as an always-on background service. Same
-# baseline as camera-watcher@.service.
+# baseline as camera-watcher.service.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -43,10 +43,12 @@ RestrictRealtime=true
 # particular may need this off depending on how it JITs.
 MemoryDenyWriteExecute=true
 
-# Unlike camera-watcher@.service, this process never rewrites its own
-# config -- only the shared data_root needs to be writable (it reads
-# clips/metadata under it and writes .analysis.json sidecars next to
-# them). classifier.yaml itself stays read-only, covered by
+# Unlike camera-watcher.service, this process never rewrites its own
+# config -- classifier.yaml is created/edited from the fleet web UI's
+# Classifier tab instead (see camera_watcher/web/routes.py), this process
+# only ever reads it. Only the shared data_root needs to be writable here
+# (it reads clips/metadata under it and writes .analysis.json sidecars next
+# to them); classifier.yaml itself stays read-only, covered by
 # ProtectSystem=strict's default. If using the Hailo backend, /dev/hailo0
 # also needs to be reachable -- see deploy/README.
 ReadWritePaths=/var/lib/camera-watcher

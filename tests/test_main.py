@@ -10,16 +10,16 @@ from camera_watcher.main import _check_port_available, _parse_args, _resolve_hos
 from camera_watcher.tailscale import TailscaleError
 
 
-def test_config_arg_is_required(monkeypatch):
+def test_config_dir_arg_is_required(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["camera_watcher"])
     with pytest.raises(SystemExit):
         _parse_args()
 
 
-def test_config_arg_is_parsed(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["camera_watcher", "--config", "config/front-door.yaml"])
+def test_config_dir_arg_is_parsed(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["camera_watcher", "--config-dir", "config"])
     args = _parse_args()
-    assert args.config == "config/front-door.yaml"
+    assert args.config_dir == "config"
 
 
 def test_check_port_available_succeeds_on_a_free_port():
@@ -64,12 +64,38 @@ def test_resolve_host_fails_loud_and_never_falls_back_to_0_0_0_0(monkeypatch):
         _resolve_host("tailscale")
 
 
-def test_main_fails_loud_without_a_configured_auth_token(tmp_path, monkeypatch, capsys):
-    config_path = tmp_path / "cam1.yaml"
-    config_path.write_text(yaml.safe_dump({"camera": {"name": "cam1", "host": "127.0.0.1"}}))
-    monkeypatch.setattr(sys, "argv", ["camera_watcher", "--config", str(config_path)])
+def test_main_fails_loud_with_a_too_weak_auth_token(tmp_path, monkeypatch, capsys):
+    # A hand-edited fleet.secrets.yaml with a too-short token -- unlike a
+    # missing/blank one (which FleetConfig auto-fills on first load), a
+    # present-but-weak token is left alone by the bootstrap and must still
+    # fail loud via require_token() rather than silently running unauthenticated.
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "fleet.secrets.yaml").write_text(yaml.safe_dump({"web": {"auth_token": "short"}}))
+    monkeypatch.setattr(sys, "argv", ["camera_watcher", "--config-dir", str(config_dir)])
 
     with pytest.raises(SystemExit):
         main()
 
     assert "auth_token" in capsys.readouterr().err
+
+
+def test_main_fails_loud_when_the_configured_port_is_taken(tmp_path, monkeypatch, capsys):
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    taken_port = holder.getsockname()[1]
+    try:
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "fleet.yaml").write_text(
+            yaml.safe_dump({"web": {"host": "127.0.0.1", "port": taken_port}})
+        )
+        monkeypatch.setattr(sys, "argv", ["camera_watcher", "--config-dir", str(config_dir)])
+
+        with pytest.raises(SystemExit):
+            main()
+
+        assert str(taken_port) in capsys.readouterr().err
+    finally:
+        holder.close()

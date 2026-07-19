@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>camera_watcher</title>
+  <title>camera_watcher -- {{ camera_id }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body>
+<body data-camera-id="{{ camera_id }}">
   <header>
-    <h1>camera_watcher</h1>
+    <a href="/" class="back-link" title="Back to all cameras">&laquo; Fleet</a>
+    <h1>{{ camera_id }}</h1>
     <nav>
       <button class="tab-btn active" data-tab="settings">Settings</button>
       <button class="tab-btn" data-tab="mask">Ignore Mask</button>
@@ -16,18 +17,16 @@
       <button class="tab-btn" data-tab="recordings">Recordings</button>
     </nav>
     <span id="status-badge" class="status-badge">--</span>
-    <button id="logout" class="logout-btn" title="Log out of this camera's web UI">Log out</button>
-    <button id="stop-server" class="danger-btn" title="Stop the camera_watcher server">Stop Server</button>
+    <button id="logout" class="logout-btn" title="Log out of the fleet web UI">Log out</button>
   </header>
 
-  <div id="shutdown-banner" class="shutdown-banner" hidden>Server is stopping. This page will stop responding.</div>
+  <div id="error-banner" class="shutdown-banner" hidden></div>
 
   <main>
     <section id="tab-settings" class="tab active">
       <form id="settings-form">
         <fieldset>
           <legend>Camera</legend>
-          <label>Name <input name="camera.name" type="text" required></label>
           <label>Host / IP <input name="camera.host" type="text" required></label>
           <label>Port <input name="camera.port" type="number" min="1" max="65535" required></label>
           <label>Main stream path (recorded) <input name="camera.main_path" type="text" placeholder="/h264Preview_01_main"></label>
@@ -40,7 +39,7 @@
           </label>
           <label>Username <input name="credentials.username" type="text" autocomplete="off"></label>
           <label>Password <input name="credentials.password" type="password" autocomplete="new-password" placeholder="(unchanged)"></label>
-          <p class="hint">Credentials are stored only in <code>config/secrets.yaml</code> on this server (gitignored) and never echoed back here.</p>
+          <p class="hint">Credentials are stored only in this camera's own secrets file on this server (gitignored) and never echoed back here.</p>
           <p class="hint">Current URL: <code id="redacted-url"></code></p>
         </fieldset>
 
@@ -62,12 +61,18 @@
           <label>Overlap between chunks (seconds) <input name="recording.overlap_seconds" type="number" min="0" max="60"></label>
         </fieldset>
 
-        <p class="hint">Retention is configured fleet-wide, not per camera -- see
-          <code>deploy/camera-retention.service</code> / <code>.timer</code>.</p>
+        <p class="hint">Retention and the web UI's own bind/auth settings are fleet-wide, not per
+          camera -- see <a href="/">Fleet Settings</a>.</p>
 
         <button type="submit">Save settings</button>
         <span id="settings-status"></span>
       </form>
+
+      <fieldset>
+        <legend>Remove this camera</legend>
+        <label class="inline-checkbox"><input id="delete-data-checkbox" type="checkbox"> Also delete its recordings and cache from disk</label>
+        <button id="delete-camera" class="danger-btn" type="button">Remove camera</button>
+      </fieldset>
     </section>
 
     <section id="tab-mask" class="tab">
@@ -130,6 +135,6 @@
     </section>
   </main>
 
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='camera.js') }}"></script>
 </body>
 </html>
