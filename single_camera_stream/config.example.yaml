@@ -1,0 +1,40 @@
+# single_camera_stream config template.
+#
+# This file is safe to commit -- it contains no credentials. To use it:
+#
+#     cp single_camera_stream/config.example.yaml single_camera_stream/config.yaml
+#     # edit config.yaml: at minimum camera.host, and camera.username/password if needed
+#     python -m single_camera_stream.main
+#
+# config.yaml (and single_camera_stream.pid, and recording.output_dir's
+# contents) are gitignored -- never commit them.
+#
+# recording.output_dir is the only relative path in this file; it resolves
+# against the directory config.yaml itself lives in, never whatever
+# directory you happen to run the command from.
+
+camera:
+  name: camera1 # required; letters/digits/_/- only -- used in clip filenames
+  host: "" # required
+  port: 554
+  path: /h264Preview_01_main # RTSP path for the stream to record
+  transport: tcp # tcp or udp
+  username: ""
+  password: ""
+
+motion:
+  enabled: true
+  analysis_width: 320 # frames are downscaled to this width before diffing, to save CPU
+  min_area: 500 # minimum contour area (px, at analysis_width) to count as motion
+  var_threshold: 25 # MOG2 sensitivity; lower = more sensitive
+  history: 300 # number of frames of background history MOG2 considers
+  draw_bounding_box: false # burn a bright green box around detected motion into recorded frames
+  box_padding_px: 12 # gap kept between the drawn box and the actual moving object
+
+recording:
+  output_dir: output # where finalized clips (and their .json metadata) are written
+  pre_buffer_seconds: 10 # seconds of video kept before motion is confirmed
+  post_buffer_seconds: 10 # seconds to keep recording after motion stops
+  max_chunk_seconds: 180 # hard cap per file (3 minutes)
+  overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
+  fallback_fps: 15 # used only until the frame buffer has enough history to measure a real rate

@@ -242,3 +242,10 @@ config/models/
 *.onnx
 *.hef
 
+# single_camera_stream: its real config (credentials), singleton PID file,
+# and recorded output are all local/runtime state, never committed. Only
+# config.example.yaml is tracked.
+single_camera_stream/config.yaml
+single_camera_stream/*.pid
+single_camera_stream/output/
+
