@@ -1,0 +1,53 @@
+[Unit]
+Description=camera_watcher fleet supervisor + web UI
+Documentation=https://github.com/clams2121/camera_watcher
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+# Crash-loop protection: if it can't stay up across 5 restarts within 5
+# minutes, stop retrying instead of hammering the disk/CPU forever.
+# `systemctl status camera-watcher` shows "start-limit-hit" when this
+# fires, so it's obvious this happened rather than silently spinning.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=camera-watcher
+Group=camera-watcher
+WorkingDirectory=/opt/camera-watcher
+ExecStart=/opt/camera-watcher/.venv/bin/python -m camera_watcher.main --config-dir /opt/camera-watcher/config
+# Restart=always (not just on-failure): the web UI's "Stop Server" button
+# sends this process a clean SIGTERM (exit 0) specifically as the way to
+# apply a saved web.host/web.port/auth-token change, which otherwise only
+# takes effect on the next process start -- Restart=always is what makes
+# that button actually restart the service instead of just killing it.
+Restart=always
+RestartSec=5
+
+# Hardening -- deliberately conservative given this handles live network
+# streams, credentials, and disk writes as an always-on background service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+# If the service fails to start with this on, it's a reasonable first thing
+# to try disabling -- see deploy/README.
+MemoryDenyWriteExecute=true
+
+# config/ (fleet.yaml, fleet.secrets.yaml, cameras/*.yaml/*.secrets.yaml/
+# *.mask.json -- all rewritten by the web UI) and the shared data_root
+# (clips, the passthrough segment cache, the motion heatmap) are the only
+# paths this process needs to write to -- everything else on the filesystem
+# stays read-only to it. Adjust these two paths if your install doesn't
+# match deploy/README's layout.
+ReadWritePaths=/opt/camera-watcher/config /var/lib/camera-watcher
+
+[Install]
+WantedBy=multi-user.target

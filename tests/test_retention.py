@@ -4,7 +4,13 @@ import os
 import time
 
 from camera_watcher.recorder import TEMP_SUFFIX
-from camera_watcher.retention import RetentionConfig, classify_tier, enforce_global_retention, enforce_retention
+from camera_watcher.retention import (
+    RetentionConfig,
+    RetentionScheduler,
+    classify_tier,
+    enforce_global_retention,
+    enforce_retention,
+)
 
 
 def _touch(path, size, mtime_offset):
@@ -425,3 +431,133 @@ def test_global_retention_prioritizes_tier_over_age_for_the_shared_budget(tmp_pa
     )
     assert removed == [low_value]  # deleted first for being low-tier, despite being newer
     assert high_value.exists()
+
+
+# ---------- RetentionScheduler (in-process, fleet supervisor) ----------
+
+
+def _settings(**overrides):
+    base = {
+        "low_max_age_hours": None,
+        "high_max_age_days": None,
+        "review_max_age_days": None,
+        "max_total_gb": None,
+        "interval_minutes": 60.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_scheduler_run_once_sweeps_using_the_current_settings(tmp_path):
+    clips_root = tmp_path / "clips"
+    clip = clips_root / "cam1" / "cam1_a.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    _touch(clip, 10, -40 * 86400)
+    _analysis(clip, "low")
+
+    scheduler = RetentionScheduler(
+        clips_root_provider=lambda: clips_root, settings_provider=lambda: _settings(low_max_age_hours=1)
+    )
+    removed = scheduler.run_once()
+
+    assert removed == [clip]
+    assert not clip.exists()
+    assert scheduler.last_run["dry_run"] is False
+    assert scheduler.last_run["removed"] == [str(clip)]
+    assert "at" in scheduler.last_run
+
+
+def test_scheduler_run_once_dry_run_deletes_nothing_and_records_it(tmp_path):
+    clips_root = tmp_path / "clips"
+    clip = clips_root / "cam1" / "cam1_a.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    _touch(clip, 10, -40 * 86400)
+    _analysis(clip, "low")
+
+    scheduler = RetentionScheduler(
+        clips_root_provider=lambda: clips_root, settings_provider=lambda: _settings(low_max_age_hours=1)
+    )
+    removed = scheduler.run_once(dry_run=True)
+
+    assert removed == [clip]
+    assert clip.exists()
+    assert scheduler.last_run["dry_run"] is True
+
+
+def test_scheduler_settings_provider_is_read_fresh_each_call(tmp_path):
+    # Proves live UI edits (a changed FleetConfig) take effect on the next
+    # run_once() without needing to reconstruct the scheduler.
+    clips_root = tmp_path / "clips"
+    clip = clips_root / "cam1" / "cam1_a.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    _touch(clip, 10, -3 * 3600)  # 3 hours old
+    _analysis(clip, "low")
+
+    current = {"low_max_age_hours": 24.0}  # too loose to expire the clip yet
+    scheduler = RetentionScheduler(
+        clips_root_provider=lambda: clips_root,
+        settings_provider=lambda: _settings(**current),
+    )
+    assert scheduler.run_once() == []
+    assert clip.exists()
+
+    current["low_max_age_hours"] = 1.0  # tightened -- as if saved from the UI
+    assert scheduler.run_once() == [clip]
+    assert not clip.exists()
+
+
+def test_scheduler_start_runs_at_least_once_promptly_then_stops_cleanly(tmp_path):
+    clips_root = tmp_path / "clips"
+    clip = clips_root / "cam1" / "cam1_a.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    _touch(clip, 10, -40 * 86400)
+    _analysis(clip, "low")
+
+    # A tiny interval so the background loop's first (immediate) sweep is
+    # all this test needs to wait on, not a real 60-minute cycle.
+    scheduler = RetentionScheduler(
+        clips_root_provider=lambda: clips_root,
+        settings_provider=lambda: _settings(low_max_age_hours=1, interval_minutes=1 / 60),
+    )
+    scheduler.start()
+    try:
+        deadline = time.time() + 5
+        while scheduler.last_run is None and time.time() < deadline:
+            time.sleep(0.05)
+        assert scheduler.last_run is not None
+        assert not clip.exists()
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_a_failed_sweep_is_logged_and_does_not_kill_the_loop(tmp_path, caplog, monkeypatch):
+    # The loop's own wait floors at 1 real minute between cycles (see
+    # _run's max(..., 1.0)), so this doesn't wait for a second sweep --
+    # instead it checks the loop thread is still alive immediately after
+    # the first sweep's exception, which is what "didn't kill the loop"
+    # actually means here.
+    import camera_watcher.retention as retention_module
+
+    calls = []
+
+    def _boom(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("simulated sweep failure")
+
+    monkeypatch.setattr(retention_module, "enforce_global_retention", _boom)
+
+    scheduler = RetentionScheduler(
+        clips_root_provider=lambda: tmp_path,
+        settings_provider=lambda: _settings(interval_minutes=60),
+    )
+    with caplog.at_level(logging.ERROR):
+        scheduler.start()
+        try:
+            deadline = time.time() + 5
+            while not calls and time.time() < deadline:
+                time.sleep(0.05)
+            assert calls  # the first sweep ran (and raised)
+            assert scheduler._thread.is_alive()  # the loop survived the exception
+        finally:
+            scheduler.stop()
+    assert "Scheduled retention sweep failed" in caplog.text

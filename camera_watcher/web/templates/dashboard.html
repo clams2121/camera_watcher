@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>camera_watcher fleet</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>camera_watcher</h1>
+    <nav>
+      <button class="tab-btn active" data-tab="cameras">Cameras</button>
+      <button class="tab-btn" data-tab="add-camera">Add Camera</button>
+      <button class="tab-btn" data-tab="fleet-settings">Fleet Settings</button>
+      <button class="tab-btn" data-tab="classifier">Classifier</button>
+    </nav>
+    <button id="logout" class="logout-btn" title="Log out">Log out</button>
+    <button id="stop-server" class="danger-btn" title="Stop the camera_watcher server">Stop Server</button>
+  </header>
+
+  <div id="shutdown-banner" class="shutdown-banner" hidden>Server is stopping. If deployed with Restart=always it will come back up automatically -- reload this page in a moment.</div>
+
+  <main>
+    <section id="tab-cameras" class="tab active">
+      <div class="mask-toolbar">
+        <button id="refresh-cameras">Refresh</button>
+      </div>
+      <ul id="camera-list" class="camera-list"><li class="hint">Loading...</li></ul>
+    </section>
+
+    <section id="tab-add-camera" class="tab">
+      <form id="add-camera-form">
+        <fieldset>
+          <legend>New camera</legend>
+          <label>Name <input name="camera.name" type="text" required pattern="[A-Za-z0-9_-]+" placeholder="front-door"></label>
+          <label>Host / IP <input name="camera.host" type="text" required></label>
+          <label>Port <input name="camera.port" type="number" min="1" max="65535" value="554"></label>
+          <label>Main stream path (recorded) <input name="camera.main_path" type="text" placeholder="/h264Preview_01_main"></label>
+          <label>Sub stream path (motion/preview) <input name="camera.sub_path" type="text" placeholder="/h264Preview_01_sub"></label>
+          <label>Transport
+            <select name="camera.transport">
+              <option value="tcp">TCP (recommended)</option>
+              <option value="udp">UDP</option>
+            </select>
+          </label>
+          <label>Username <input name="credentials.username" type="text" autocomplete="off"></label>
+          <label>Password <input name="credentials.password" type="password" autocomplete="new-password"></label>
+          <p class="hint">All cameras share one data root -- clips, cache, and retention are managed
+            fleet-wide (see Fleet Settings), not per camera. A camera starts recording immediately
+            once added, even before you've finished tuning motion sensitivity or drawing an ignore
+            mask -- open its page any time to adjust those.</p>
+        </fieldset>
+        <button type="submit">Add camera</button>
+        <span id="add-camera-status"></span>
+      </form>
+    </section>
+
+    <section id="tab-fleet-settings" class="tab">
+      <form id="fleet-settings-form">
+        <fieldset>
+          <legend>Web UI binding</legend>
+          <label>Host <input name="web.host" type="text"></label>
+          <label>Port <input name="web.port" type="number" min="1" max="65535"></label>
+          <p class="hint">"tailscale" resolves this host's Tailscale IPv4 address at startup and binds
+            only there -- fails loud rather than falling back to a public/LAN interface. Set an
+            explicit literal host (e.g. "127.0.0.1") to bind somewhere else instead. Changes here take
+            effect on the next restart, not immediately -- use Stop Server above once deployed with
+            Restart=always.</p>
+        </fieldset>
+        <fieldset>
+          <legend>Retention</legend>
+          <label>Low-tier max age (hours) <input name="retention.low_max_age_hours" type="number" min="0" step="0.1"></label>
+          <label>High-tier max age (days) <input name="retention.high_max_age_days" type="number" min="0" step="0.1"></label>
+          <label>Review-tier max age (days) <input name="retention.review_max_age_days" type="number" min="0" step="0.1"></label>
+          <label>Shared size budget, GB <input name="retention.max_total_gb" type="number" min="0" step="0.1" placeholder="unlimited"></label>
+          <label>Sweep interval (minutes) <input name="retention.interval_minutes" type="number" min="1" step="1"></label>
+          <p class="hint">Applies live, no restart needed -- the next scheduled sweep (or a manual run
+            below) always uses whatever's saved here. A clip's tier (low/review/high) comes from the
+            clip classifier's verdict, if one's configured -- see the Classifier tab.</p>
+        </fieldset>
+        <button type="submit">Save fleet settings</button>
+        <span id="fleet-settings-status"></span>
+      </form>
+
+      <fieldset>
+        <legend>Run retention</legend>
+        <div class="mask-toolbar">
+          <button id="run-retention-dry" type="button">Preview (dry run)</button>
+          <button id="run-retention-now" type="button">Run now</button>
+        </div>
+        <pre id="retention-output" class="hint"></pre>
+      </fieldset>
+
+      <fieldset>
+        <legend>Auth token</legend>
+        <p class="hint">Rotating generates a new token immediately, but this running process keeps
+          accepting the OLD one until it restarts -- your current session stays valid either way.</p>
+        <button id="rotate-token" type="button">Rotate auth token</button>
+        <pre id="rotate-token-output" class="hint"></pre>
+      </fieldset>
+    </section>
+
+    <section id="tab-classifier" class="tab">
+      <p class="hint"><code>clip_classifier</code> is a separate process/service that watches this
+        fleet's clips and writes verdict sidecars (see the Recordings tab on each camera's page). This
+        form only edits its config file -- it doesn't start, stop, or install that process.</p>
+      <form id="classifier-settings-form">
+        <fieldset>
+          <legend>Clip classifier (tier 1)</legend>
+          <label>Backend
+            <select name="backend">
+              <option value="auto">auto (Hailo-8L if available, else CPU)</option>
+              <option value="cpu">cpu (ONNX Runtime, YOLOv8n)</option>
+              <option value="hailo">hailo (fails loud if unavailable)</option>
+            </select>
+          </label>
+          <label>High-confidence threshold <input name="thresholds.high_confidence" type="number" min="0" max="1" step="0.01"></label>
+          <label>Large-object area fraction <input name="thresholds.review_large_object_area_frac" type="number" min="0" max="1" step="0.01"></label>
+          <label>Persistent-detection frame fraction <input name="thresholds.review_persistent_detection_frac" type="number" min="0" max="1" step="0.01"></label>
+          <label>Max sampled frames per clip <input name="sampling.max_frames" type="number" min="1" step="1"></label>
+        </fieldset>
+        <button type="submit">Save classifier settings</button>
+        <span id="classifier-settings-status"></span>
+      </form>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

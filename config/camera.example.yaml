@@ -1,20 +1,20 @@
-# camera_watcher per-camera config template.
+# camera_watcher per-camera config reference template.
 #
-# This file is safe to commit -- it contains no credentials. To configure a
-# new camera, copy this file and edit the copy:
+# This file is safe to commit -- it contains no credentials. It's a
+# reference for the full set of options, not something you need to copy
+# by hand: the normal way to add a camera is the fleet web UI's Add
+# Camera tab (see the root README's "Configuring a camera" section),
+# which creates config/cameras/<name>.yaml (in this same shape) and
+# config/cameras/<name>.secrets.yaml for you, and each camera's own
+# Settings tab rewrites its config/cameras/<name>.yaml from then on.
 #
-#     cp config/camera.example.yaml config/<name>.yaml
-#     cp config/camera.secrets.example.yaml config/<name>.secrets.yaml   # then fill in real credentials
-#     python -m camera_watcher.main --config config/<name>.yaml
-#
-# Every relative path in this file (data_root, secrets_path, mask.path,
-# recording.output_dir, recording.cache_dir, motion.heatmap_path) resolves
-# against the directory this file lives in -- never against whatever
-# directory you happen to run the command from. Absolute paths are also
-# fine and pass through unchanged.
-#
-# Edit by hand, or via the web UI's Settings tab, which rewrites this file
-# (and only this file -- it never touches secrets or the mask).
+# If you're creating or editing one by hand anyway (scripting a fleet
+# rollout, say): every relative path in this file (data_root,
+# secrets_path, mask.path, recording.output_dir, recording.cache_dir,
+# motion.heatmap_path) resolves against the directory this file lives in
+# -- never against whatever directory you happen to run a command from.
+# Absolute paths are also fine and pass through unchanged. camera.name
+# must match the filename (config/cameras/<name>.yaml).
 
 # Shared root for this camera's output (clips, heatmap state, etc). Several
 # per-camera config files commonly point at the *same* data_root (e.g. a
@@ -59,16 +59,14 @@ recording:
   overlap_seconds: 5 # seconds repeated at the start of the next chunk on a forced split
 
 # Retention is NOT configured here -- it's fleet-wide, not per camera, and
-# runs externally on a schedule against the whole shared data_root. See
-# deploy/camera-retention.service + .timer + deploy/README.
+# runs as a background thread inside the fleet supervisor itself. See the
+# root README's "Retention" section, or the Fleet Settings tab.
 
+# The web UI itself is also fleet-wide, not per camera -- one bind, one
+# auth token, configured in config/fleet.yaml / the Fleet Settings tab,
+# not here. preview_fps is the one camera-specific web behavior left: the
+# live-preview MJPEG stream's frame rate for this camera.
 web:
-  # "tailscale" resolves this host's Tailscale IPv4 address at startup and
-  # binds only there -- fails loud (refuses to start) rather than falling
-  # back to 0.0.0.0 if Tailscale isn't installed/logged in. Set an explicit
-  # literal address (e.g. "127.0.0.1") to bind somewhere else instead.
-  host: tailscale
-  port: 8080 # each camera on the same host MUST use a different port -- startup fails loud on a collision
   preview_fps: 5
 
 mask:

@@ -1,9 +1,14 @@
-"""HTTP routes for the camera_watcher web UI.
+"""HTTP routes for the camera_watcher fleet web UI.
 
-Deliberately small: a settings form, a mask editor, a live preview, and a
-recordings browser -- nothing else. All state changes are written straight
-through to disk via :class:`~camera_watcher.config.Config` and applied to
-the running pipeline immediately, with no separate "apply" step.
+Two halves: fleet-level routes (camera list/add/remove, fleet settings,
+retention, the classifier's config file, login/shutdown) and camera-scoped
+routes, all under ``/api/cameras/<camera_id>/...`` (settings, mask, live
+preview, recordings). All state changes are written straight through to
+disk via :class:`~camera_watcher.fleet.FleetConfig` /
+:class:`~camera_watcher.config.Config` and applied to the running pipeline
+immediately, with no separate "apply" step -- except web bind host/port and
+the auth token, which need a process restart, called out explicitly in
+their responses.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
+import yaml
 from flask import (
     Blueprint,
     Response,
@@ -34,7 +40,11 @@ from flask import (
 )
 
 from ..auth import tokens_match
+from ..config import ConfigError
 from ..constants import TEMP_SUFFIX
+from ..fleet import CameraManager, FleetConfig
+from ..retention import RetentionScheduler
+from ..yaml_store import deep_merge
 
 bp = Blueprint("camera_watcher", __name__)
 logger = logging.getLogger(__name__)
@@ -51,6 +61,292 @@ _PUBLIC_ENDPOINTS = {"camera_watcher.login_page", "camera_watcher.login"}
 _CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.mp4$")
 _CLIP_TS_RE = re.compile(r"_(\d{8})_(\d{6})\.mp4$")
 _BUCKET_RE = re.compile(r"^\d{8}_\d{4}$")
+
+CLASSIFIER_CONFIG_FILENAME = "classifier.yaml"
+_CLASSIFIER_DEFAULTS = {
+    "data_root": "",  # "" -> filled in from the fleet's shared data_root below
+    "backend": "auto",
+    "cpu": {"model_path": "models/yolov8n.onnx"},
+    "hailo": {"hef_path": "models/yolov8n.hef"},
+    "thresholds": {
+        "high_confidence": 0.5,
+        "review_large_object_area_frac": 0.05,
+        "review_persistent_detection_frac": 0.6,
+        "review_persistent_motion_detection_size": 0.05,
+        "review_persistent_motion_frame_ratio": 0.6,
+    },
+    "sampling": {"max_frames": 5, "min_frame_spacing_seconds": 1.0},
+    "watch": {"queue_maxsize": 256, "rescan_interval_seconds": 600},
+}
+
+
+def _fleet_config() -> FleetConfig:
+    return current_app.config["FLEET_CONFIG"]
+
+
+def _camera_manager() -> CameraManager:
+    return current_app.config["CAMERA_MANAGER"]
+
+
+def _retention_scheduler() -> RetentionScheduler:
+    return current_app.config["RETENTION_SCHEDULER"]
+
+
+def _json_error(status: int, message: str) -> Response:
+    response = jsonify({"ok": False, "error": message})
+    response.status_code = status
+    return response
+
+
+def _require_camera(camera_id: str):
+    """Returns (config, pipeline) for a running camera. Aborts with a plain
+    404 if no such camera exists at all, or a JSON 503 carrying the stored
+    error message if the camera exists but failed to load/start -- distinct
+    signals so the UI can tell "no such camera" from "this one needs
+    attention". Used by routes that need the live pipeline (snapshot,
+    stream, mask, heatmap, status) -- see _require_camera_config for routes
+    that only need the persisted settings and should keep working even for
+    an errored camera."""
+    manager = _camera_manager()
+    config = manager.get_config(camera_id)
+    pipeline = manager.get_pipeline(camera_id)
+    if config is not None and pipeline is not None:
+        return config, pipeline
+    error = manager.get_error(camera_id)
+    if error is not None:
+        abort(_json_error(503, f"Camera {camera_id!r} failed to start: {error}"))
+    abort(404)
+
+
+def _require_camera_config(camera_id: str):
+    """Returns this camera's Config regardless of whether its pipeline is
+    currently running -- so a camera that failed to start (bad host,
+    missing credentials, whatever) can still have its settings viewed and
+    fixed through the UI, and its existing recordings still browsed."""
+    try:
+        config = _camera_manager().get_config_for_editing(camera_id)
+    except ConfigError as e:
+        abort(_json_error(503, f"Camera {camera_id!r}'s config can't be loaded: {e}"))
+    if config is None:
+        abort(404)
+    return config
+
+
+@bp.before_request
+def _require_auth():
+    if request.endpoint in _PUBLIC_ENDPOINTS:
+        return None
+
+    if session.get("authenticated"):
+        return None
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        candidate = auth_header[len("Bearer ") :]
+        if tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
+            return None
+
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return redirect(url_for("camera_watcher.login_page"))
+
+
+@bp.get("/login")
+def login_page():
+    return render_template("login.html")
+
+
+@bp.post("/api/login")
+def login():
+    body = request.get_json(force=True, silent=True) or {}
+    candidate = str(body.get("token", ""))
+    if not tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
+        return jsonify({"ok": False, "error": "invalid token"}), 401
+    session["authenticated"] = True
+    return jsonify({"ok": True})
+
+
+@bp.post("/api/logout")
+def logout():
+    session.pop("authenticated", None)
+    return jsonify({"ok": True})
+
+
+@bp.get("/")
+def index():
+    return render_template("dashboard.html")
+
+
+@bp.get("/cameras/<camera_id>")
+def camera_page(camera_id: str):
+    if not _camera_manager().exists(camera_id):
+        abort(404)
+    return render_template("camera.html", camera_id=camera_id)
+
+
+# ---------- Fleet: camera list / add / remove ----------
+
+
+@bp.get("/api/cameras")
+def list_cameras():
+    return jsonify({"cameras": _camera_manager().list_cameras()})
+
+
+@bp.post("/api/cameras")
+def create_camera():
+    body = request.get_json(force=True, silent=True) or {}
+    settings_patch = body.get("settings") or {}
+    credentials = body.get("credentials") or {}
+    secrets_patch = None
+    cred_patch = {k: v for k, v in credentials.items() if k in ("username", "password") and v}
+    if cred_patch:
+        secrets_patch = {"camera": cred_patch}
+
+    try:
+        camera = _camera_manager().add_camera(settings_patch, secrets_patch)
+    except ConfigError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, "camera": camera}), 201
+
+
+@bp.delete("/api/cameras/<camera_id>")
+def delete_camera(camera_id: str):
+    manager = _camera_manager()
+    if not manager.exists(camera_id):
+        abort(404)
+    delete_data = request.args.get("delete_data", "").strip().lower() in ("1", "true", "yes")
+    manager.remove_camera(camera_id, delete_data=delete_data)
+    return jsonify({"ok": True})
+
+
+# ---------- Camera-scoped: settings ----------
+
+
+@bp.get("/api/cameras/<camera_id>/settings")
+def get_camera_settings(camera_id: str):
+    config = _require_camera_config(camera_id)
+    return jsonify(
+        {
+            "settings": config.settings,
+            "has_credentials": config.has_credentials(),
+            "redacted_rtsp_url": config.redacted_rtsp_url(),
+            "error": _camera_manager().get_error(camera_id),
+        }
+    )
+
+
+@bp.post("/api/cameras/<camera_id>/settings")
+def post_camera_settings(camera_id: str):
+    manager = _camera_manager()
+    if not manager.exists(camera_id):
+        abort(404)
+
+    body = request.get_json(force=True, silent=True) or {}
+    settings_patch = body.get("settings")
+    credentials = body.get("credentials") or {}
+    secrets_patch = None
+    cred_patch = {k: v for k, v in credentials.items() if k in ("username", "password") and v}
+    if cred_patch:
+        secrets_patch = {"camera": cred_patch}
+
+    try:
+        manager.update_camera(camera_id, settings_patch=settings_patch, secrets_patch=secrets_patch)
+    except ConfigError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Camera %r failed to apply updated settings", camera_id)
+        return jsonify({"ok": False, "error": f"Settings were saved, but applying them failed: {e}"}), 500
+
+    config = manager.get_config_for_editing(camera_id)
+    return jsonify(
+        {
+            "ok": True,
+            "settings": config.settings,
+            "has_credentials": config.has_credentials(),
+            "redacted_rtsp_url": config.redacted_rtsp_url(),
+            "error": manager.get_error(camera_id),
+        }
+    )
+
+
+# ---------- Camera-scoped: live status / preview / mask ----------
+
+
+@bp.get("/api/cameras/<camera_id>/status")
+def get_camera_status(camera_id: str):
+    _, pipeline = _require_camera(camera_id)
+    return jsonify(pipeline.status())
+
+
+@bp.get("/api/cameras/<camera_id>/snapshot")
+def get_camera_snapshot(camera_id: str):
+    _, pipeline = _require_camera(camera_id)
+    latest = pipeline.frame_buffer.latest()
+    if latest is None:
+        return jsonify({"error": "no frames available yet"}), 503
+    ok, buf = cv2.imencode(".jpg", latest.frame)
+    if not ok:
+        return jsonify({"error": "failed to encode snapshot"}), 500
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+@bp.get("/api/cameras/<camera_id>/mask")
+def get_camera_mask(camera_id: str):
+    _, pipeline = _require_camera(camera_id)
+    return jsonify({"polygons": pipeline.mask_store.polygons})
+
+
+@bp.post("/api/cameras/<camera_id>/mask")
+def post_camera_mask(camera_id: str):
+    _, pipeline = _require_camera(camera_id)
+    body = request.get_json(force=True, silent=True) or {}
+    polygons = body.get("polygons", [])
+    pipeline.mask_store.save(polygons)
+    pipeline.reload_mask()
+    return jsonify({"ok": True, "polygons": pipeline.mask_store.polygons})
+
+
+@bp.get("/api/cameras/<camera_id>/stream")
+def get_camera_stream(camera_id: str):
+    config, pipeline = _require_camera(camera_id)
+    fps = max(1, min(15, config.settings["web"].get("preview_fps", 5)))
+    interval = 1.0 / fps
+
+    def generate():
+        last_ts = None
+        while True:
+            latest = pipeline.frame_buffer.latest()
+            if latest is not None and latest.timestamp != last_ts:
+                last_ts = latest.timestamp
+                frame = pipeline.frame_for_preview(latest.frame)
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+                    )
+            time.sleep(interval)
+
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@bp.get("/api/cameras/<camera_id>/heatmap.png")
+def get_camera_heatmap(camera_id: str):
+    _, pipeline = _require_camera(camera_id)
+    png = pipeline.heatmap_png()
+    if png is None:
+        return jsonify({"error": "no motion analyzed yet"}), 503
+    return Response(png, mimetype="image/png")
+
+
+@bp.post("/api/cameras/<camera_id>/heatmap/reset")
+def reset_camera_heatmap(camera_id: str):
+    _, pipeline = _require_camera(camera_id)
+    pipeline.reset_heatmap()
+    return jsonify({"ok": True})
+
+
+# ---------- Camera-scoped: recordings ----------
 
 
 def _clip_start_datetime(path: Path, stat) -> datetime:
@@ -121,150 +417,6 @@ def _unlink_clip_and_metadata(file_path: Path) -> None:
             logger.exception("Failed to remove sidecar file %s", sidecar_path)
 
 
-def _config():
-    return current_app.config["CAMERA_CONFIG"]
-
-
-def _pipeline():
-    return current_app.config["CAMERA_PIPELINE"]
-
-
-@bp.before_request
-def _require_auth():
-    if request.endpoint in _PUBLIC_ENDPOINTS:
-        return None
-
-    if session.get("authenticated"):
-        return None
-
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        candidate = auth_header[len("Bearer ") :]
-        if tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
-            return None
-
-    if request.path.startswith("/api/"):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return redirect(url_for("camera_watcher.login_page"))
-
-
-@bp.get("/login")
-def login_page():
-    return render_template("login.html")
-
-
-@bp.post("/api/login")
-def login():
-    body = request.get_json(force=True, silent=True) or {}
-    candidate = str(body.get("token", ""))
-    if not tokens_match(candidate, current_app.config["AUTH_TOKEN"]):
-        return jsonify({"ok": False, "error": "invalid token"}), 401
-    session["authenticated"] = True
-    return jsonify({"ok": True})
-
-
-@bp.post("/api/logout")
-def logout():
-    session.pop("authenticated", None)
-    return jsonify({"ok": True})
-
-
-@bp.get("/")
-def index():
-    return render_template("index.html")
-
-
-@bp.get("/api/settings")
-def get_settings():
-    config = _config()
-    return jsonify(
-        {
-            "settings": config.settings,
-            "has_credentials": config.has_credentials(),
-            "redacted_rtsp_url": config.redacted_rtsp_url(),
-        }
-    )
-
-
-@bp.post("/api/settings")
-def post_settings():
-    body = request.get_json(force=True, silent=True) or {}
-    config = _config()
-    pipeline = _pipeline()
-
-    settings_patch = body.get("settings")
-    if settings_patch:
-        config.update_settings(settings_patch)
-
-    credentials = body.get("credentials")
-    if credentials:
-        patch = {}
-        if credentials.get("username"):
-            patch["username"] = credentials["username"]
-        if credentials.get("password"):
-            patch["password"] = credentials["password"]
-        if patch:
-            config.update_secrets({"camera": patch})
-
-    pipeline.apply_settings(config.resolved())
-    return jsonify({"ok": True, "settings": config.settings, "has_credentials": config.has_credentials()})
-
-
-@bp.get("/api/status")
-def get_status():
-    return jsonify(_pipeline().status())
-
-
-@bp.get("/api/snapshot")
-def get_snapshot():
-    latest = _pipeline().frame_buffer.latest()
-    if latest is None:
-        return jsonify({"error": "no frames available yet"}), 503
-    ok, buf = cv2.imencode(".jpg", latest.frame)
-    if not ok:
-        return jsonify({"error": "failed to encode snapshot"}), 500
-    return Response(buf.tobytes(), mimetype="image/jpeg")
-
-
-@bp.get("/api/mask")
-def get_mask():
-    return jsonify({"polygons": _pipeline().mask_store.polygons})
-
-
-@bp.post("/api/mask")
-def post_mask():
-    body = request.get_json(force=True, silent=True) or {}
-    polygons = body.get("polygons", [])
-    pipeline = _pipeline()
-    pipeline.mask_store.save(polygons)
-    pipeline.reload_mask()
-    return jsonify({"ok": True, "polygons": pipeline.mask_store.polygons})
-
-
-@bp.get("/api/stream")
-def get_stream():
-    pipeline = _pipeline()
-    fps = max(1, min(15, _config().settings["web"].get("preview_fps", 5)))
-    interval = 1.0 / fps
-
-    def generate():
-        last_ts = None
-        while True:
-            latest = pipeline.frame_buffer.latest()
-            if latest is not None and latest.timestamp != last_ts:
-                last_ts = latest.timestamp
-                frame = pipeline.frame_for_preview(latest.frame)
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                if ok:
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
-                    )
-            time.sleep(interval)
-
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
-
-
 def _recording_entry(p: Path, stat) -> dict:
     analysis = _read_json_best_effort(_analysis_path(p))
     review = _read_json_best_effort(_review_path(p))
@@ -287,12 +439,13 @@ def _recording_entry(p: Path, stat) -> dict:
     }
 
 
-@bp.get("/api/recordings")
-def list_recordings():
+@bp.get("/api/cameras/<camera_id>/recordings")
+def list_recordings(camera_id: str):
     """Recordings grouped into 30-minute buckets aligned to :00/:30, newest
     group first, newest clip first within each group -- lets the UI offer a
     "delete this whole half-hour" action alongside per-clip delete."""
-    output_dir = Path(_config().resolved()["recording"]["output_dir"])
+    config = _require_camera_config(camera_id)
+    output_dir = Path(config.resolved()["recording"]["output_dir"])
     buckets: dict = {}
     if output_dir.exists():
         for p in output_dir.iterdir():
@@ -312,22 +465,23 @@ def list_recordings():
     return jsonify({"groups": groups})
 
 
-def _resolve_clip_path(filename: str) -> Optional[Path]:
+def _resolve_clip_path(output_dir: Path, filename: str) -> Optional[Path]:
     """Validates `filename` against the recorder's naming pattern and resolves
     it against the clips directory, refusing anything that would escape it.
     Returns None if the name is invalid or doesn't point at a real, finalized clip."""
     if not _CLIP_NAME_RE.match(filename) or filename.endswith(TEMP_SUFFIX):
         return None
-    output_dir = Path(_config().resolved()["recording"]["output_dir"])
     file_path = (output_dir / filename).resolve()
     if output_dir not in file_path.parents or not file_path.is_file():
         return None
     return file_path
 
 
-@bp.get("/api/recordings/<filename>")
-def get_recording(filename: str):
-    file_path = _resolve_clip_path(filename)
+@bp.get("/api/cameras/<camera_id>/recordings/<filename>")
+def get_recording(camera_id: str, filename: str):
+    config = _require_camera_config(camera_id)
+    output_dir = Path(config.resolved()["recording"]["output_dir"])
+    file_path = _resolve_clip_path(output_dir, filename)
     if file_path is None:
         abort(404)
 
@@ -336,9 +490,11 @@ def get_recording(filename: str):
     return send_file(file_path, mimetype="video/mp4", conditional=True)
 
 
-@bp.delete("/api/recordings/<filename>")
-def delete_recording(filename: str):
-    file_path = _resolve_clip_path(filename)
+@bp.delete("/api/cameras/<camera_id>/recordings/<filename>")
+def delete_recording(camera_id: str, filename: str):
+    config = _require_camera_config(camera_id)
+    output_dir = Path(config.resolved()["recording"]["output_dir"])
+    file_path = _resolve_clip_path(output_dir, filename)
     if file_path is None:
         abort(404)
     try:
@@ -349,14 +505,16 @@ def delete_recording(filename: str):
     return jsonify({"ok": True})
 
 
-@bp.post("/api/recordings/<filename>/review")
-def review_recording(filename: str):
+@bp.post("/api/cameras/<camera_id>/recordings/<filename>/review")
+def review_recording(camera_id: str, filename: str):
     """Records a human reviewer's keep/discard decision for a clip
     clip_classifier flagged as "review" -- writes <stem>.review.json
     either way; "discard" additionally deletes the clip (and its whole
     sidecar family, review.json included) via the same path the plain
     Delete button uses. This route is the sole writer of review.json."""
-    file_path = _resolve_clip_path(filename)
+    config = _require_camera_config(camera_id)
+    output_dir = Path(config.resolved()["recording"]["output_dir"])
+    file_path = _resolve_clip_path(output_dir, filename)
     if file_path is None:
         abort(404)
 
@@ -395,12 +553,13 @@ def review_recording(filename: str):
     return jsonify({"ok": True, "decision": decision, "deleted": False})
 
 
-@bp.delete("/api/recordings/group/<bucket>")
-def delete_recording_group(bucket: str):
+@bp.delete("/api/cameras/<camera_id>/recordings/group/<bucket>")
+def delete_recording_group(camera_id: str, bucket: str):
     if not _BUCKET_RE.match(bucket):
         abort(404)
 
-    output_dir = Path(_config().resolved()["recording"]["output_dir"])
+    config = _require_camera_config(camera_id)
+    output_dir = Path(config.resolved()["recording"]["output_dir"])
     deleted = []
     errors = []
     if output_dir.exists():
@@ -425,25 +584,110 @@ def delete_recording_group(bucket: str):
     return jsonify({"ok": True, "deleted": deleted, "errors": errors})
 
 
-@bp.get("/api/heatmap.png")
-def get_heatmap():
-    png = _pipeline().heatmap_png()
-    if png is None:
-        return jsonify({"error": "no motion analyzed yet"}), 503
-    return Response(png, mimetype="image/png")
+# ---------- Fleet: settings, retention, classifier config ----------
 
 
-@bp.post("/api/heatmap/reset")
-def reset_heatmap():
-    _pipeline().reset_heatmap()
-    return jsonify({"ok": True})
+@bp.get("/api/fleet/settings")
+def get_fleet_settings():
+    return jsonify({"settings": _fleet_config().settings})
+
+
+@bp.post("/api/fleet/settings")
+def post_fleet_settings():
+    body = request.get_json(force=True, silent=True) or {}
+    patch = body.get("settings")
+    fc = _fleet_config()
+    if patch:
+        fc.update_settings(patch)
+    return jsonify(
+        {
+            "ok": True,
+            "settings": fc.settings,
+            "note": "web.host/web.port changes take effect on the next restart, not immediately.",
+        }
+    )
+
+
+@bp.post("/api/fleet/auth-token/rotate")
+def rotate_auth_token():
+    new_token = _fleet_config().rotate_auth_token()
+    return jsonify(
+        {
+            "ok": True,
+            "token": new_token,
+            "note": "Saved, but this process keeps using the OLD token until it restarts -- your "
+            "session stays valid until then. Restart the service to make the new token active.",
+        }
+    )
+
+
+@bp.post("/api/fleet/retention/run")
+def run_retention_now():
+    body = request.get_json(force=True, silent=True) or {}
+    dry_run = bool(body.get("dry_run"))
+    removed = _retention_scheduler().run_once(dry_run=dry_run)
+    return jsonify({"ok": True, "dry_run": dry_run, "removed": [str(p) for p in removed]})
+
+
+@bp.get("/api/fleet/retention/status")
+def get_retention_status():
+    return jsonify({"last_run": _retention_scheduler().last_run})
+
+
+def _classifier_config_path() -> Path:
+    return _fleet_config().config_dir / CLASSIFIER_CONFIG_FILENAME
+
+
+@bp.get("/api/classifier/settings")
+def get_classifier_settings():
+    path = _classifier_config_path()
+    raw = {}
+    if path.is_file():
+        try:
+            raw = yaml.safe_load(path.read_text()) or {}
+        except yaml.YAMLError as e:
+            return jsonify({"ok": False, "error": f"classifier.yaml is not valid YAML: {e}"}), 500
+    settings = deep_merge(_CLASSIFIER_DEFAULTS, raw)
+    if not settings.get("data_root"):
+        settings["data_root"] = str(_fleet_config().resolved_data_root())
+    return jsonify({"exists": path.is_file(), "settings": settings})
+
+
+@bp.post("/api/classifier/settings")
+def post_classifier_settings():
+    body = request.get_json(force=True, silent=True) or {}
+    patch = body.get("settings")
+    if not isinstance(patch, dict):
+        return jsonify({"ok": False, "error": "settings must be an object"}), 400
+
+    path = _classifier_config_path()
+    raw = {}
+    if path.is_file():
+        try:
+            raw = yaml.safe_load(path.read_text()) or {}
+        except yaml.YAMLError as e:
+            return jsonify({"ok": False, "error": f"classifier.yaml is not valid YAML: {e}"}), 500
+
+    merged = deep_merge(deep_merge(_CLASSIFIER_DEFAULTS, raw), patch)
+    if not merged.get("data_root"):
+        merged["data_root"] = str(_fleet_config().resolved_data_root())
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(yaml.safe_dump(merged, sort_keys=False))
+    tmp_path.replace(path)
+    return jsonify({"ok": True, "settings": merged})
+
+
+# ---------- Fleet: shutdown ----------
 
 
 def _schedule_shutdown(delay: float = 0.5) -> None:
     """Send this process SIGTERM shortly after returning, so the HTTP
     response has time to flush to the client before shutdown begins. main.py
-    already handles SIGTERM by cleanly stopping the pipeline (capture,
-    recorder, retention, accumulator) before exiting -- reused as-is here."""
+    already handles SIGTERM by cleanly stopping every camera, the retention
+    scheduler, then exiting -- reused as-is here. Deployed with
+    Restart=always (see deploy/camera-watcher.service), the process comes
+    back up automatically -- this is how bind/token changes actually apply."""
     threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
 
 
@@ -454,6 +698,12 @@ def shutdown():
     if confirm != _SHUTDOWN_CONFIRM_TEXT:
         return jsonify({"ok": False, "error": f'confirmation text must be "{_SHUTDOWN_CONFIRM_TEXT}"'}), 400
 
-    logger.warning("Shutdown requested via the web UI -- stopping the server.")
+    logger.warning("Shutdown requested via the web UI -- stopping the fleet supervisor.")
     _schedule_shutdown()
-    return jsonify({"ok": True, "message": "Server is stopping."})
+    return jsonify(
+        {
+            "ok": True,
+            "message": "Server is stopping. If deployed under systemd (Restart=always), it will come "
+            "back up automatically, picking up any saved config changes.",
+        }
+    )

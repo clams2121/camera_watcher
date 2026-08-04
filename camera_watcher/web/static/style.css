@@ -402,3 +402,38 @@ button[type="submit"], .mask-toolbar button {
   font-size: 0.85rem;
   opacity: 0.85;
 }
+
+.back-link {
+  font-size: 0.85rem;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.back-link:hover { text-decoration: underline; }
+
+.camera-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.camera-link {
+  color: inherit;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.camera-link:hover { text-decoration: underline; }
+
+#retention-output, #rotate-token-output {
+  white-space: pre-wrap;
+  word-break: break-all;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  margin: 0.5rem 0 0;
+  min-height: 1.2rem;
+}

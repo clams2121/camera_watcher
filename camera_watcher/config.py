@@ -1,19 +1,18 @@
-"""Configuration loading and persistence for a single camera process.
+"""Configuration loading and persistence for a single camera.
 
-Each camera is configured by exactly one YAML file, passed via
-``main.py --config /path/to/<camera>.yaml``. There is no "current working
-directory" assumption anywhere in this module: every relative path found in
--- or derived from -- that file resolves against the directory *containing*
-the config file. This is what makes it safe to run several camera processes
-(systemd template units, cron, whatever) from any working directory.
+Each camera is configured by exactly one YAML file, one per camera under the
+fleet's ``config/cameras/`` directory (see fleet.py's ``CameraManager``,
+which discovers and owns these). There is no "current working directory"
+assumption anywhere in this module: every relative path found in -- or
+derived from -- a camera's config file resolves against the directory
+*containing* that file.
 
-``--config`` must point at a real file. Nothing here silently creates one:
-seeding a config the caller explicitly named would hide a typo ("did I
-really mean to start a fresh camera named front-door2?") behind what looks
-like a successful startup, which is exactly the kind of silent fallback
-these tools are built to avoid. Copy the template and edit it first:
-
-    cp config/camera.example.yaml config/<name>.yaml
+``Config(path)`` requires the file to already exist -- it never silently
+creates one; loading a path that was never created would otherwise hide a
+typo behind what looks like a successful load. The one place allowed to
+create a new camera config is ``Config.create()``, used by the fleet UI's
+"add camera" flow, where creating a new file is exactly the intent rather
+than a possible typo.
 
 Camera credentials live in a separate file referenced *from* the main
 config (``secrets_path``, default ``<camera.name>.secrets.yaml`` next to
@@ -31,14 +30,13 @@ import copy
 import re
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote
 
-import yaml
+from .yaml_store import deep_merge, load_yaml, save_yaml
 
-# Used in filenames (clip names, sidecar names) and will be used as a
-# systemd template-unit instance name later -- keep it to characters that
-# are safe in both contexts.
+# Used in filenames (clip names, sidecar names) and as the systemd/fleet
+# camera id -- keep it to characters that are safe in both contexts.
 CAMERA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -93,17 +91,15 @@ DEFAULTS: dict[str, Any] = {
         "max_chunk_seconds": 180,
         "overlap_seconds": 5,
     },
-    # Retention is no longer configured per-camera -- see
-    # deploy/camera-retention.service + .timer, which sweep the whole
-    # fleet's shared data_root against one global budget instead (see
-    # retention.enforce_global_retention).
+    # Retention is fleet-wide, not per camera -- see fleet.py's FleetConfig
+    # (retention windows/budget) and the in-process retention scheduler in
+    # main.py, which sweeps every camera's clips under one shared data_root.
+    #
+    # The web UI itself is also fleet-wide now -- one process, one bind, one
+    # auth token, all in FleetConfig -- so there is no per-camera web.host/
+    # web.port here any more. preview_fps is the one camera-specific piece
+    # of "web" behavior left (the live-preview MJPEG stream's frame rate).
     "web": {
-        # "tailscale" resolves this host's Tailscale IPv4 address at startup
-        # (see tailscale.py) and binds only there -- fails loud rather than
-        # falling back to 0.0.0.0 if that can't be resolved. Set an explicit
-        # literal host (e.g. "127.0.0.1") to bypass Tailscale entirely.
-        "host": "tailscale",
-        "port": 8080,
         "preview_fps": 5,
     },
     "mask": {
@@ -112,39 +108,10 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
-# Camera credentials and the web UI's auth token -- never logged, never
-# round-tripped through the settings API.
-SECRET_DEFAULTS: dict[str, Any] = {"camera": {"username": "", "password": ""}, "web": {"auth_token": ""}}
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    result = copy.deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
-def _load_yaml(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with path.open("r") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _save_yaml(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w") as f:
-        yaml.safe_dump(data, f, sort_keys=False)
-    tmp_path.replace(path)
-    try:
-        # Best-effort: keep the secrets file from being world/group readable.
-        path.chmod(0o600)
-    except OSError:
-        pass
+# Camera credentials -- never logged, never round-tripped through the
+# settings API. The web UI's auth token now lives in FleetConfig (fleet.py)
+# instead, since the UI is fleet-wide rather than per-camera.
+SECRET_DEFAULTS: dict[str, Any] = {"camera": {"username": "", "password": ""}}
 
 
 class Config:
@@ -166,6 +133,20 @@ class Config:
         self.secrets_path: Path = self.config_path  # placeholder until reload() resolves the real one
         self.reload()
 
+    @classmethod
+    def create(cls, config_path: Path | str, settings_patch: Optional[dict] = None) -> "Config":
+        """Creates a brand-new camera config file at `config_path` from
+        DEFAULTS deep-merged with `settings_patch`, then loads it normally.
+        Raises ConfigError if a file already exists there. This is the one
+        place allowed to create a camera config from nothing -- used by
+        fleet.py's CameraManager.add_camera(), where "create a new one" is
+        exactly the caller's intent, unlike __init__ above."""
+        config_path = Path(config_path)
+        if config_path.exists():
+            raise ConfigError(f"{config_path} already exists -- refusing to overwrite it.")
+        save_yaml(config_path, deep_merge(DEFAULTS, settings_patch or {}))
+        return cls(config_path)
+
     def _resolve(self, raw: str) -> Path:
         """Resolves `raw` against this config file's directory, unless it's
         already absolute. Never touches cwd."""
@@ -174,8 +155,8 @@ class Config:
 
     def reload(self) -> None:
         with self._lock:
-            raw = _load_yaml(self.config_path)
-            settings = _deep_merge(DEFAULTS, raw)
+            raw = load_yaml(self.config_path)
+            settings = deep_merge(DEFAULTS, raw)
 
             camera_name = settings["camera"].get("name") or ""
             if not camera_name:
@@ -190,7 +171,7 @@ class Config:
             self._settings = settings
             secrets_rel = settings.get("secrets_path") or f"{camera_name}.secrets.yaml"
             self.secrets_path = self._resolve(secrets_rel)
-            self._secrets = _deep_merge(SECRET_DEFAULTS, _load_yaml(self.secrets_path))
+            self._secrets = deep_merge(SECRET_DEFAULTS, load_yaml(self.secrets_path))
 
     @property
     def settings(self) -> dict:
@@ -240,15 +221,15 @@ class Config:
     def update_settings(self, patch: dict) -> dict:
         """Deep-merge ``patch`` into settings and persist to disk."""
         with self._lock:
-            self._settings = _deep_merge(self._settings, patch)
-            _save_yaml(self.config_path, self._settings)
+            self._settings = deep_merge(self._settings, patch)
+            save_yaml(self.config_path, self._settings)
             return copy.deepcopy(self._settings)
 
     def update_secrets(self, patch: dict) -> None:
         """Deep-merge ``patch`` into secrets and persist to disk. Never returns the result."""
         with self._lock:
-            self._secrets = _deep_merge(self._secrets, patch)
-            _save_yaml(self.secrets_path, self._secrets)
+            self._secrets = deep_merge(self._secrets, patch)
+            save_yaml(self.secrets_path, self._secrets)
 
     def has_credentials(self) -> bool:
         with self._lock:

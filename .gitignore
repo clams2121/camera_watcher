@@ -217,12 +217,16 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# camera_watcher: never commit camera credentials, per-camera config, or captured video/state.
-# Each camera gets its own config/<name>.yaml (settings) and
-# config/<name>.secrets.yaml (credentials) -- both end in .yaml, so one
-# pattern covers both; only the generic config/camera.example.yaml template
-# is explicitly un-ignored below.
+# camera_watcher: never commit camera credentials, fleet/per-camera config,
+# or captured video/state.
+# Fleet-wide files (fleet.yaml, fleet.secrets.yaml, classifier.yaml) live
+# directly under config/; per-camera files (cameras/<name>.yaml,
+# cameras/<name>.secrets.yaml, cameras/<name>.mask.json) live under
+# config/cameras/ -- all created and rewritten by the app itself (the
+# fleet web UI), never by hand. Only the generic reference templates are
+# explicitly un-ignored below.
 config/*.yaml
+config/cameras/
 !config/camera.example.yaml
 !config/camera.secrets.example.yaml
 !config/classifier.example.yaml
@@ -237,4 +241,11 @@ data/
 config/models/
 *.onnx
 *.hef
+
+# single_camera_stream: its real config (credentials), singleton PID file,
+# and recorded output are all local/runtime state, never committed. Only
+# config.example.yaml is tracked.
+single_camera_stream/config.yaml
+single_camera_stream/*.pid
+single_camera_stream/output/
 

@@ -1,4 +1,6 @@
-"""Wires capture, motion detection, and recording into one running service.
+"""Wires capture, motion detection, and recording into one running worker,
+one instance per camera, all owned and supervised by fleet.py's
+CameraManager inside the single fleet supervisor process (see main.py).
 
 Threading model: each stage runs on its own thread so a slow one never stalls
 another --
@@ -10,14 +12,15 @@ another --
   disk. It's decoupled from capture via ``_frame_queue`` so a slow disk
   write never backs up the RTSP read loop.
 - A small timer thread periodically persists the motion heatmap
-  accumulator. Retention is no longer an in-process thread here at all --
-  see deploy/camera-retention.service + .timer, which sweep the whole
-  fleet's shared data_root on a schedule instead (see retention.py's
-  enforce_global_retention).
-- The Flask web UI runs on the main thread (via a threaded WSGI server), so
-  it keeps answering requests regardless of what the other threads are
-  doing -- it never touches the camera directly, only the shared,
-  thread-safe ``frame_buffer`` and ``Config``.
+  accumulator. Retention is not a per-camera thread here at all -- it runs
+  once, fleet-wide, as its own background thread in the supervisor process
+  (see retention.py's RetentionScheduler), sweeping every camera's clips
+  under the shared data_root on a schedule.
+- The Flask web UI (see web/routes.py) runs in the same process on its own
+  threaded WSGI server, so it keeps answering requests regardless of what
+  any camera's threads are doing -- it never touches a camera directly,
+  only the shared, thread-safe ``frame_buffer`` and ``Config`` each
+  CameraPipeline exposes.
 """
 from __future__ import annotations
 
@@ -57,8 +60,8 @@ _HEATMAP_PERSIST_INTERVAL_SECONDS = 300  # 5 minutes
 
 class CameraPipeline:
     """Owns the capture thread, motion detector, recorder, and segment cache
-    for one camera. Retention is handled externally -- see
-    deploy/camera-retention.service + .timer."""
+    for one camera. Retention is handled fleet-wide, outside this class --
+    see retention.py's RetentionScheduler, run once by the supervisor."""
 
     def __init__(self, config: Config):
         self.config = config

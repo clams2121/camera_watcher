@@ -1,12 +1,15 @@
 """Disk retention for finalized clips.
 
-Deliberately standalone (importable functions + CLI) rather than baked into
-any one camera's process -- see deploy/camera-retention.service +
-.timer, which invoke this on a schedule against the whole fleet's shared
-data_root, replacing what used to be an in-process thread per camera. This
-module intentionally has no third-party dependencies (unlike the rest of
-the project, it needs no OpenCV/Flask/PyYAML) so it can run standalone
-wherever Python 3 is available.
+The importable functions here (``enforce_retention``, ``enforce_global_
+retention``, ``classify_tier``) have no third-party dependencies (unlike
+most of the project, this needs no OpenCV/Flask/PyYAML) so they -- and the
+``python -m camera_watcher.retention`` CLI below -- can run standalone
+wherever Python 3 is available, e.g. for manual/diagnostic sweeps.
+``RetentionScheduler`` at the bottom is the fleet supervisor's in-process
+equivalent of what used to be an external systemd timer: a background
+thread that calls the same functions on a schedule, reading settings live
+from FleetConfig each cycle so UI edits apply on the next run without a
+restart.
 
 Verdict-aware since clip_classifier exists: each clip is sorted into a
 retention tier (classify_tier below) by reading its <stem>.analysis.json /
@@ -19,10 +22,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from .constants import TEMP_SUFFIX
 
@@ -279,6 +283,67 @@ def enforce_global_retention(
         verb = "would remove" if dry_run else "removed"
         logger.info("Global retention %s %d clip(s) across %d camera dir(s)", verb, len(removed), len(camera_dirs))
     return removed
+
+
+class RetentionScheduler:
+    """Background thread run inside the fleet supervisor process, calling
+    enforce_global_retention on a schedule -- the in-process replacement
+    for what used to be an external camera-retention.service/.timer pair.
+
+    `clips_root_provider`/`settings_provider` are callables (not static
+    values) so every cycle -- and every `run_once()` call, e.g. from a
+    "run now" button in the UI -- picks up whatever's currently saved in
+    FleetConfig, including live edits made since the thread started.
+    `settings_provider` must return a dict shaped like FleetConfig's
+    `settings["retention"]` (low_max_age_hours, high_max_age_days,
+    review_max_age_days, max_total_gb, interval_minutes).
+    """
+
+    def __init__(self, clips_root_provider: Callable[[], Path], settings_provider: Callable[[], dict]):
+        self._clips_root_provider = clips_root_provider
+        self._settings_provider = settings_provider
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # {"at": epoch seconds, "dry_run": bool, "removed": [str, ...]} for
+        # the last completed sweep -- read by the UI's fleet status view.
+        self.last_run: Optional[dict] = None
+
+    def start(self) -> None:
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="retention-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    def run_once(self, dry_run: bool = False) -> List[Path]:
+        """Runs a single sweep immediately with the current settings.
+        Safe to call from a request thread (e.g. a UI "run retention now"
+        button) concurrently with the scheduled loop -- enforce_global_
+        retention has no shared mutable state beyond the filesystem itself."""
+        settings = self._settings_provider()
+        removed = enforce_global_retention(
+            self._clips_root_provider(),
+            low_max_age_hours=settings.get("low_max_age_hours"),
+            high_max_age_days=settings.get("high_max_age_days"),
+            review_max_age_days=settings.get("review_max_age_days"),
+            max_total_gb=settings.get("max_total_gb"),
+            dry_run=dry_run,
+        )
+        self.last_run = {"at": time.time(), "dry_run": dry_run, "removed": [str(p) for p in removed]}
+        return removed
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.run_once(dry_run=False)
+            except Exception:
+                logger.exception("Scheduled retention sweep failed")
+            interval_minutes = self._settings_provider().get("interval_minutes") or 60.0
+            if self._stop_event.wait(max(float(interval_minutes), 1.0) * 60):
+                break
 
 
 def _parse_args():

@@ -1,18 +1,24 @@
-"""Flask app factory for the camera_watcher web UI."""
+"""Flask app factory for the camera_watcher fleet web UI."""
 from __future__ import annotations
 
 import hashlib
 
 from flask import Flask
 
-from ..config import Config
-from ..pipeline import CameraPipeline
+from ..fleet import CameraManager, FleetConfig
+from ..retention import RetentionScheduler
 
 
-def create_app(config: Config, pipeline: CameraPipeline, auth_token: str) -> Flask:
+def create_app(
+    fleet_config: FleetConfig,
+    camera_manager: CameraManager,
+    retention_scheduler: RetentionScheduler,
+    auth_token: str,
+) -> Flask:
     app = Flask(__name__)
-    app.config["CAMERA_CONFIG"] = config
-    app.config["CAMERA_PIPELINE"] = pipeline
+    app.config["FLEET_CONFIG"] = fleet_config
+    app.config["CAMERA_MANAGER"] = camera_manager
+    app.config["RETENTION_SCHEDULER"] = retention_scheduler
     app.config["AUTH_TOKEN"] = auth_token
     # Derived from the auth token (itself a real secret) rather than a
     # separate generated value -- one less thing to configure/rotate, and
